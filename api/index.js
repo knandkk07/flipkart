@@ -2088,7 +2088,7 @@ async function proxySubdomain(
 const workerObj = {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    const path = url.pathname;
+    const path = request.headers.get("x-invoke-path") || request.headers.get("x-matched-path") || url.pathname;
     const origin = request.headers.get("origin") || "";
     const base = `${url.protocol}//${url.host}/`;
 
