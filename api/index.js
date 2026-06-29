@@ -2001,7 +2001,7 @@ async function proxySubdomain(
   env,
   jar, // per-request cookie Map
 ) {
-  const target = `https://${subdomain}/${subpath}${qs}`;
+  const target = API_DOMAINS.test(subdomain) ? `https://flipkart.knandkk07.workers.dev/__fk/${subdomain}/${subpath}${qs}` : `https://${subdomain}/${subpath}${qs}`;
 
   if (CDN_DOMAINS.test(subdomain) && STATIC_EXT.test(subpath.split("?")[0]))
     return Response.redirect(target, 302);
