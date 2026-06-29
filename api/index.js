@@ -2626,8 +2626,19 @@ const workerObj = {
           }
           : {}),
       };
+      
+      // Clean headers for Cloudflare Worker tunnel to prevent Cloudflare Error 1000
+      delete h["Host"];
+      delete h["host"];
+      delete h["CF-Connecting-IP"];
+      delete h["cf-connecting-ip"];
+      delete h["CF-Ray"];
+      delete h["cf-ray"];
+      delete h["CF-Visitor"];
+      delete h["cf-visitor"];
       return h;
     }
+
 
     const t0 = Date.now();
     let upstream;
