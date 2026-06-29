@@ -2001,7 +2001,7 @@ async function proxySubdomain(
   env,
   jar, // per-request cookie Map
 ) {
-  const target = `https://flipkart.knandkk07.workers.dev/__fk/${subdomain}/${subpath}${qs}`;
+  const target = `https://${subdomain}/${subpath}${qs}`;
 
   if (CDN_DOMAINS.test(subdomain) && STATIC_EXT.test(subpath.split("?")[0]))
     return Response.redirect(target, 302);
@@ -2017,10 +2017,13 @@ async function proxySubdomain(
 
   const isApi = API_DOMAINS.test(subdomain);
   const cookie = buildCookieHeader(request.headers.get("cookie") || "", jar);
-  const clientIp =
-    request.headers.get("CF-Connecting-IP") ||
-    request.headers.get("X-Forwarded-For") ||
-    "";
+  
+      const clientIp = request.headers.get("x-forwarded-for")?.split(',')[0]?.trim() || 
+                       request.headers.get("x-real-ip") || 
+                       request.headers.get("cf-connecting-ip") || 
+                       request.headers.get("true-client-ip") || 
+                       "157.33.24.110";
+
   const fwdH = isApi
     ? apiHeaders(request.headers, cookie, clientIp)
     : {
@@ -2034,14 +2037,12 @@ async function proxySubdomain(
       ...(request.headers.get("content-type")
         ? { "Content-Type": request.headers.get("content-type") }
         : {}),
-      ...(clientIp
-        ? {
-          "X-Forwarded-For": clientIp,
-          "X-Real-IP": clientIp,
-          "True-Client-IP": clientIp,
-          "CF-Connecting-IP": clientIp,
-        }
-        : {}),
+      "X-Forwarded-For": clientIp,
+        "X-Real-IP": clientIp,
+        "True-Client-IP": clientIp,
+        "CF-Connecting-IP": clientIp,
+        "Client-IP": clientIp,
+        "X-Client-IP": clientIp,
     };
 
   let bodyBuf = null,
@@ -2545,7 +2546,7 @@ const workerObj = {
     }
 
     const fkPath = path === "/" ? "" : path.replace(/^\//, "");
-    const fkTarget = `https://flipkart.knandkk07.workers.dev/${fkPath}${url.search}`;
+    const fkTarget = `https://www.flipkart.com/${fkPath}${url.search}`;
 
     let bodyBuf = null;
     if (!["GET", "HEAD"].includes(request.method))
@@ -2558,10 +2559,13 @@ const workerObj = {
     ];
     const useDesktop = DESKTOP_PATHS.some((p) => fkPath.startsWith(p));
 
-    const clientIp =
-      request.headers.get("CF-Connecting-IP") ||
-      request.headers.get("X-Forwarded-For") ||
-      "";
+    
+      const clientIp = request.headers.get("x-forwarded-for")?.split(',')[0]?.trim() || 
+                       request.headers.get("x-real-ip") || 
+                       request.headers.get("cf-connecting-ip") || 
+                       request.headers.get("true-client-ip") || 
+                       "157.33.24.110";
+
 
     function buildMainHeaders() {
       const cookie = buildCookieHeader(
@@ -2617,28 +2621,15 @@ const workerObj = {
         ...(request.headers.get("content-type")
           ? { "Content-Type": request.headers.get("content-type") }
           : {}),
-        ...(clientIp
-          ? {
-            "X-Forwarded-For": clientIp,
-            "X-Real-IP": clientIp,
-            "True-Client-IP": clientIp,
-            "CF-Connecting-IP": clientIp,
-          }
-          : {}),
+        "X-Forwarded-For": clientIp,
+        "X-Real-IP": clientIp,
+        "True-Client-IP": clientIp,
+        "CF-Connecting-IP": clientIp,
+        "Client-IP": clientIp,
+        "X-Client-IP": clientIp,
       };
-      
-      // Clean headers for Cloudflare Worker tunnel to prevent Cloudflare Error 1000
-      delete h["Host"];
-      delete h["host"];
-      delete h["CF-Connecting-IP"];
-      delete h["cf-connecting-ip"];
-      delete h["CF-Ray"];
-      delete h["cf-ray"];
-      delete h["CF-Visitor"];
-      delete h["cf-visitor"];
       return h;
     }
-
 
     const t0 = Date.now();
     let upstream;
